@@ -6,12 +6,12 @@ from dataclasses import dataclass
 @dataclass
 class GPTConfig:
   num_layers: int = 12
-  num_heads: int = 16
-  embed_size: int = 1024
-  block_size: int = 1024
-  vocab_size: int = 50304
+  num_heads: int = 12
+  embed_size: int = 768
+  vocab_size: int = 50257
+  context_size: int = 1024
   dropout: float = 0.0
-  bias: bool = False
+  bias: bool = True
 
 
 class LayerNorm(nn.Module):
@@ -26,6 +26,7 @@ class LayerNorm(nn.Module):
 class Attention(nn.Module):
   def __init__(self, config):
     super().__init__()
+    self.config = config
     self.qkv = nn.Linear(config.embed_size, config.embed_size*3, bias=config.bias)
     self.proj = nn.Linear(config.embed_size, config.embed_size, bias=config.bias)
     self.dropout = nn.Dropout(config.dropout)
@@ -70,16 +71,27 @@ class GPT(nn.Module):
   def __init__(self, config):
     super().__init__()
     self.embed_tokens = nn.Embedding(config.vocab_size, config.embed_size)
-    self.embed_pos = nn.Embedding(config.block_size, config.embed_size)
+    self.embed_pos = nn.Embedding(config.context_size, config.embed_size)
     self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
     self.dropout = nn.Dropout(config.dropout)
     self.ln = LayerNorm(config.embed_size, bias=config.bias)
-    self.fc_out = nn.Linear(config.embed_size, config.vocab_size)
+    self.fc_out = nn.Linear(config.embed_size, config.vocab_size, bias=False)
 
   def forward(self, x):
-    x = self.embed_tokens(x) + self.embed_pos(x)
+    pos = torch.arange(0, x.shape[-1], dtype=torch.int32, device=x.device)
+    x = self.embed_tokens(x) + self.embed_pos(pos)
     x = self.dropout(x)
     for block in self.blocks:
       x = block(x)
     x = self.fc_out(self.ln(x))
     return x
+
+  def sample(self, x):
+    with torch.no_grad():
+      logits = self(x)
+    probs = F.softmax(logits[:,-1], dim=-1)
+    tokens = torch.multinomial(probs, num_samples=1)
+    return tokens
+
+  def loss(self, logits, targets):
+    return F.cross_entropy(logits.flatten(end_dim=-1), targets, ignore_index=-1)
