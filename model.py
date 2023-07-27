@@ -86,12 +86,17 @@ class GPT(nn.Module):
     x = self.fc_out(self.ln(x))
     return x
 
-  def sample(self, x):
-    with torch.no_grad():
-      logits = self(x)
-    probs = F.softmax(logits[:,-1], dim=-1)
-    tokens = torch.multinomial(probs, num_samples=1)
-    return tokens
-
   def loss(self, logits, targets):
     return F.cross_entropy(logits.flatten(end_dim=-1), targets, ignore_index=-1)
+
+  @torch.no_grad()
+  def generate(self, x, num_tokens:int = 1, temperature:float = 1.0, top_k:int = -1):
+    for _ in range(num_tokens):
+      logits = self(x)[:, -1] / temperature
+      if top_k > 0:
+        v, _ = torch.topk(logits, top_k)
+        logits[logits < v[:, -1:]] = -torch.inf
+      probs = F.softmax(logits, dim=-1)
+      next_token = torch.multinomial(probs, num_samples=1)
+      x = torch.cat([x, next_token], dim=1)
+    return x
