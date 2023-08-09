@@ -36,10 +36,11 @@ class Attention(nn.Module):
     H = self.config.num_heads
     q, k, v = self.qkv(x).view(B, T, 3, H, C // H).transpose(1, 3).unbind(dim=2)  # B, H, T, C // H
     if past is not None:  # write KV into the buffer
+      assert past_len == 0 or T == 1  # since is_causal has to be disabled
       past[:, :, 0, past_len:past_len+T], past[:, :, 1, past_len:past_len+T] = k, v
       k, v = past[:, :, 0, :past_len+T], past[:, :, 1, :past_len+T]
 
-    x = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, dropout_p=self.config.dropout if self.training else 0)
+    x = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=T > 1, dropout_p=self.config.dropout if self.training else 0)
     x = x.transpose(1, 2).contiguous().view(B, T, C)  # join the heads together
     x = self.proj(x)
     x = self.dropout(x)
@@ -84,7 +85,7 @@ class GPT(nn.Module):
 
   def forward(self, x, past=None, past_len=0):
     assert past is None or past_len < past.shape[4]
-    pos = torch.arange(0, x.shape[-1], dtype=torch.int32, device=x.device)
+    pos = torch.arange(past_len, past_len+x.shape[-1], dtype=torch.int32, device=x.device)
     x = self.embed_tokens(x) + self.embed_pos(pos)
     x = self.dropout(x)
     for i, block in enumerate(self.blocks):
@@ -95,18 +96,16 @@ class GPT(nn.Module):
   def loss(self, logits, targets):
     return F.cross_entropy(logits.flatten(end_dim=-1), targets, ignore_index=-1)
 
-  def sample(self, context, past=None, past_len=0, temperature=1.0, top_k=-1):
-    logits = self(context, past, past_len)[:, -1] / temperature
-    if top_k > 0:
-      v, _ = torch.topk(logits, top_k)
-      logits[logits < v[:, -1:]] = -torch.inf
-    probs = F.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
-
   @torch.no_grad()
   def generate(self, context, num_tokens=1, temperature=1.0, top_k=-1):
     past = torch.zeros(len(context), self.config.num_layers, self.config.num_heads, 2, self.config.context_size, self.config.embed_size // self.config.num_heads)
-    samples = [self.sample(context, past, 0, temperature, top_k)]
+    self(context, past, 0)  # init the kv cache
     for i in range(num_tokens-1):
-      samples.append(self.sample(samples[-1], past, context.shape[1]+i, temperature, top_k))
-    return torch.cat([context, *samples], dim=1)
+      logits = self(context[:,-1:], past, context.shape[1]+i-1)[:, -1] / temperature
+      if top_k > 0:
+        v, _ = torch.topk(logits, top_k)
+        logits[logits < v[:, -1:]] = -torch.inf
+      probs = F.softmax(logits, dim=-1)
+      next_token = torch.multinomial(probs, num_samples=1)
+      context = torch.cat([context, next_token], dim=-1)
+    return context
