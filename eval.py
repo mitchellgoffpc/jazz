@@ -7,8 +7,9 @@ from model import GPT, GPTConfig
 
 if __name__ == '__main__':
   # Load weights
-  weights_url = 'https://huggingface.co/gpt2/resolve/main/pytorch_model.bin'
-  checkpoint_fn = '/tmp/gpt2.ckpt'
+  model = 'gpt2'
+  weights_url = f'https://huggingface.co/{model}/resolve/main/pytorch_model.bin'
+  checkpoint_fn = f'/tmp/{model}.ckpt'
 
   if not os.path.exists(checkpoint_fn):
     r = requests.get(weights_url, stream=True)
@@ -44,18 +45,23 @@ if __name__ == '__main__':
   state_dict = {k: v.transpose(-1, -2) if any(x in k for x in linears) else v for k,v in state_dict.items()}
   state_dict['fc_out.weight'] = state_dict['embed_tokens.weight']
 
-  device = 'mps'
+  device = 'cpu'
   config = GPTConfig()
   model = GPT(config).to(device)
   model.load_state_dict(state_dict)
-
   tokenizer = tiktoken.get_encoding("gpt2")
+
   prompt = "The capital of Germany is Berlin. The capital of France is"
   context = torch.tensor(tokenizer.encode(prompt))[None].to(device)
-
-  idx = model.generate(context, num_tokens=2, top_k=10)
+  result = model.generate(context, num_tokens=10, top_k=10)
   print(f"Prompt:    ", prompt)
-  print(f"Completion:", tokenizer.decode(idx[0].tolist()))
+  print(f"Completion:", tokenizer.decode(result[0].tolist()))
+
+  prompt = "Hi my name is Chris but I have been with Nokia for many years."
+  context = torch.tensor(tokenizer.encode(prompt))[None].to(device)
+  result = model.generate(context, num_tokens=50, top_k=10)
+  print(f"Prompt:    ", prompt)
+  print(f"Completion:", tokenizer.decode(result[0].tolist()))
 
   large_context = torch.randint(0, 50257, size=(1, 1024)).to(device)
 
