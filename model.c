@@ -1,6 +1,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 #define NUM_LAYERS 12
@@ -8,6 +9,8 @@
 #define VOCAB_SIZE 50257
 #define EMBED_SIZE 768
 #define CONTEXT_SIZE 1024
+#define HEAD_SIZE (EMBED_SIZE / NUM_HEADS)
+#define CACHE_SIZE (2 * CONTEXT_SIZE * EMBED_SIZE)
 
 
 // Definitions
@@ -109,8 +112,8 @@ void init_state(State* state) {
 
 // Helper Functions
 
-#define ELEMENTWISE(i, n, out, expr) ({ for (int (i) = 0; (i) < (n); i++) { out[i] = (expr); } out; })
-#define REDUCE(i, n, acc, expr) ({ float acc = 0; for (int (i) = 0; (i) < (n); i++) { acc = (expr); } acc; })
+#define ELEMENTWISE(i, n, out, expr) ({ for (int i = 0; i < (n); i++) { out[i] = (expr); } out; })
+#define REDUCE(i, n, acc, expr) ({ float acc = 0; for (int i = 0; i < (n); i++) { acc = (expr); } acc; })
 
 float* add(float* out, float* x, float* y, int n) {
   return ELEMENTWISE(i, n, out, x[i] + y[i]);
@@ -139,6 +142,12 @@ float max(float* x, int n) {
 float* matmul(float* out, float* A, float* X, int n_cols, int n_rows) {
   for (int row = 0; row < n_rows; row++) {
     out[row] = REDUCE(col, n_cols, acc, acc + A[row*n_cols + col] * X[col]);
+  }
+  return out;
+}
+float* matvmul(float* out, float* X, float* A, int n_rows, int n_cols) {
+  for (int col = 0; col < n_cols; col++) {
+    out[col] = REDUCE(row, n_rows, acc, acc + X[row] * A[row*n_cols + col]);
   }
   return out;
 }
@@ -181,14 +190,19 @@ float* norm(float* out, LayerNorm* norm, int layer, float* x) {
 
 float* attention(GPT2* model, State* state, float* past, int past_len, int layer, float* x) {
   float* qkv, *attn, *q, *k, *v;
-  int head_size = EMBED_SIZE / NUM_HEADS;
   qkv = linear(state->qkv, &model->qkv, layer, x);
   q = &qkv[0], k = &qkv[EMBED_SIZE], v = &qkv[2*EMBED_SIZE];
+
   for (int i = 0; i < NUM_HEADS; i++) {
-    attn = matmul(&state->attn[i], &k[i*head_size], &q[i*head_size], head_size, past_len+1);
-    attn = scale(&state->attn[i], (1.0 / sqrt(head_size)), past_len+1);
-    attn = softmax(&state->attn[i], past_len+1);
-    matmul(&state->attn_out[i*head_size], &v[i*head_size], &state->attn[i], past_len+1, EMBED_SIZE);
+    float* k_past = &past[i*CONTEXT_SIZE*HEAD_SIZE];
+    float* v_past = &past[NUM_HEADS*CONTEXT_SIZE*HEAD_SIZE + i*CONTEXT_SIZE*HEAD_SIZE];
+    memcpy(&k_past[past_len*HEAD_SIZE], &k[i*HEAD_SIZE], HEAD_SIZE*sizeof(float));
+    memcpy(&v_past[past_len*HEAD_SIZE], &v[i*HEAD_SIZE], HEAD_SIZE*sizeof(float));
+
+    attn = matmul(state->attn, k_past, &q[i*HEAD_SIZE], HEAD_SIZE, past_len+1);
+    attn = scale(state->attn, (1.0 / sqrt(HEAD_SIZE)), past_len+1);
+    attn = softmax(state->attn, past_len+1);
+    attn = matvmul(&state->attn_out[i*HEAD_SIZE], attn, v_past, past_len+1, HEAD_SIZE);
   }
   x = linear(state->proj, &model->proj, layer, state->attn_out);
   return x;
@@ -204,7 +218,7 @@ float* gpt(GPT2* model, State* state, float* past, int past_len, int token) {
   float* x;
   x = add(state->x, embedding(model->embed_tokens, token), embedding(model->embed_pos, past_len), EMBED_SIZE);
   for (int i = 0; i < NUM_LAYERS; i++) {
-    x = add(state->x, x, attention(model, state, past, past_len, i, norm(state->ln1, &model->ln1, i, x)), EMBED_SIZE);
+    x = add(state->x, x, attention(model, state, &past[i*CACHE_SIZE], past_len, i, norm(state->ln1, &model->ln1, i, x)), EMBED_SIZE);
     x = add(state->x, x, mlp(model, state, i, norm(state->ln2, &model->ln2, i, x)), EMBED_SIZE);
   }
   x = matmul(state->out, model->fc_out, norm(state->x, &model->ln_out, 0, x), EMBED_SIZE, VOCAB_SIZE);
@@ -224,6 +238,16 @@ int main() {
   init_model(f, model);
   init_state(state);
 
-  gpt(model, state, past, 0, 1);
+  // The capital of Germany is Berlin. The capital of France is ...
+  int tokens[12] = {464, 3139, 286, 4486, 318, 11307, 13, 383, 3139, 286, 4881, 318};
+  for (int i = 0; i < 12; i++) {
+    gpt(model, state, past, i, tokens[i]);
+  }
+
+  int argmax = 0;
+  for (int i = 0; i < VOCAB_SIZE; i++) {
+    argmax = state->out[i] > state->out[argmax] ? i : argmax;
+  }
+  assert(argmax == 6342);  // Paris
   printf("DONE\n");
 }
