@@ -1,6 +1,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #define NUM_LAYERS 12
 #define NUM_HEADS 12
@@ -14,6 +15,12 @@
 typedef struct {
   float* weight;
   float* bias;
+  int size;
+} LayerNorm;
+
+typedef struct {
+  float* weight;
+  float* bias;
   int in_size;
   int out_size;
 } Linear;
@@ -21,10 +28,13 @@ typedef struct {
 typedef struct {
   float* embed_tokens;
   float* embed_pos;
+  LayerNorm ln1;
+  LayerNorm ln2;
   Linear qkv;
   Linear proj;
   Linear fc1;
   Linear fc2;
+  LayerNorm ln_out;
   float* fc_out;
 } GPT2;
 
@@ -34,6 +44,7 @@ typedef struct {
   float* ln1;
   float* qkv;
   float* attn;
+  float* attn_out;
   float* proj;
   float* ln2;
   float* fc1;
@@ -44,21 +55,42 @@ typedef struct {
 
 // Initialization
 
-void init_linear(Linear* layer, int in_size, int out_size) {
-  layer->weight = malloc(in_size * out_size * sizeof(float));
-  layer->bias = malloc(out_size * sizeof(float));
+float* load_layer(FILE* f, int expected_size) {
+  size_t layer_size;
+  fread(&layer_size, sizeof(size_t), 1, f);
+  assert(layer_size == expected_size);
+  float* data = malloc(layer_size*sizeof(float));
+  fread(data, sizeof(float), layer_size, f);
+  return data;
+}
+
+void init_layernorm(FILE* f, LayerNorm* norm, int num_layers, int size) {
+  norm->weight = load_layer(f, num_layers * size);
+  norm->bias = load_layer(f, num_layers * size);
+  norm->size = size;
+}
+
+void init_linear(FILE* f, Linear* layer, int num_layers, int in_size, int out_size) {
+  layer->weight = load_layer(f, num_layers * in_size * out_size);
+  layer->bias = load_layer(f, num_layers * out_size);
   layer->in_size = in_size;
   layer->out_size = out_size;
 }
 
-void init_model(GPT2* model) {
-  model->embed_tokens = malloc(VOCAB_SIZE * EMBED_SIZE * sizeof(float));
-  model->embed_pos = malloc(CONTEXT_SIZE * EMBED_SIZE * sizeof(float));
-  init_linear(&model->qkv, EMBED_SIZE, 3*EMBED_SIZE);
-  init_linear(&model->proj, EMBED_SIZE, EMBED_SIZE);
-  init_linear(&model->fc1, EMBED_SIZE, 4*EMBED_SIZE);
-  init_linear(&model->fc2, 4*EMBED_SIZE, EMBED_SIZE);
-  model->fc_out = malloc(EMBED_SIZE * VOCAB_SIZE * sizeof(float));
+void init_model(FILE* f, GPT2* model) {
+  size_t n_weights, layer_size;
+  fread(&n_weights, sizeof(size_t), 1, f);
+
+  model->embed_tokens = load_layer(f, VOCAB_SIZE * EMBED_SIZE);
+  model->embed_pos = load_layer(f, CONTEXT_SIZE * EMBED_SIZE);
+  init_layernorm(f, &model->ln1, NUM_LAYERS, EMBED_SIZE);
+  init_layernorm(f, &model->ln2, NUM_LAYERS, EMBED_SIZE);
+  init_linear(f, &model->qkv, NUM_LAYERS,  EMBED_SIZE, 3*EMBED_SIZE);
+  init_linear(f, &model->proj, NUM_LAYERS, EMBED_SIZE, EMBED_SIZE);
+  init_linear(f, &model->fc1, NUM_LAYERS, EMBED_SIZE, 4*EMBED_SIZE);
+  init_linear(f, &model->fc2, NUM_LAYERS, 4*EMBED_SIZE, EMBED_SIZE);
+  init_layernorm(f, &model->ln_out, 1, EMBED_SIZE);
+  model->fc_out = load_layer(f, EMBED_SIZE * VOCAB_SIZE);
 }
 
 void init_state(State* state) {
@@ -66,9 +98,10 @@ void init_state(State* state) {
   state->ln1 = malloc(EMBED_SIZE * sizeof(float));
   state->qkv = malloc(3*EMBED_SIZE * sizeof(float));
   state->attn = malloc(CONTEXT_SIZE * sizeof(float));
+  state->attn_out = malloc(EMBED_SIZE * sizeof(float));
   state->proj = malloc(EMBED_SIZE * sizeof(float));
   state->ln2 = malloc(EMBED_SIZE * sizeof(float));
-  state->fc1 = malloc(EMBED_SIZE * sizeof(float));
+  state->fc1 = malloc(4*EMBED_SIZE * sizeof(float));
   state->fc2 = malloc(EMBED_SIZE * sizeof(float));
   state->out = malloc(EMBED_SIZE * sizeof(float));
 }
@@ -110,9 +143,9 @@ float* matmul(float* out, float* A, float* X, int n_cols, int n_rows) {
   return out;
 }
 
-float* linear(float* out, Linear* layer, float* data) {
-  out = matmul(out, layer->weight, data, layer->in_size, layer->out_size);
-  out = add(out, layer->bias, out, layer->out_size);
+float* linear(float* out, Linear* fc, int layer, float* data) {
+  out = matmul(out, &fc->weight[layer*fc->in_size*fc->out_size], data, fc->in_size, fc->out_size);
+  out = add(out, &fc->bias[layer*fc->out_size], out, fc->out_size);
   return out;
 }
 
@@ -123,22 +156,24 @@ float* embedding(float* data, int idx) {
 float* softmax(float* x, int n) {
   x = shift(x, -max(x, n), n);
   x = vexp(x, n);
-  x = scale(x, 1 / sum(x, n), n);
+  x = scale(x, 1.0 / sum(x, n), n);
   return x;
 }
 
-float* norm(float* x) {
-  float mean = 0, std = 0;
-  for (int i = 0; i < EMBED_SIZE; i++) {
-    mean += x[i] / EMBED_SIZE;
+float* norm(float* out, LayerNorm* norm, int layer, float* x) {
+  float mean = 0, var = 0;
+  for (int i = 0; i < norm->size; i++) {
+    mean += x[i] / norm->size;
   }
-  for (int i = 0; i < EMBED_SIZE; i++) {
-    std += (x[i] - mean) * (x[i] - mean);
+  for (int i = 0; i < norm->size; i++) {
+    var += (x[i] - mean) * (x[i] - mean) / norm->size;
   }
-  for (int i = 0; i < EMBED_SIZE; i++) {
-    x[i] = (x[i] - mean) / std;
+  float std = sqrt(var) + 1e-5; // epsilon
+  for (int i = 0; i < norm->size; i++) {
+    out[i] = (x[i] - mean) / std;
+    out[i] = out[i] * norm->weight[layer*norm->size + i] + norm->bias[layer*norm->size + i];
   }
-  return x;
+  return out;
 }
 
 
@@ -146,19 +181,22 @@ float* norm(float* x) {
 
 float* attention(GPT2* model, State* state, float* past, int past_len, int layer, float* x) {
   float* qkv, *attn, *q, *k, *v;
-  qkv = linear(state->qkv, &model->qkv, x);
+  int head_size = EMBED_SIZE / NUM_HEADS;
+  qkv = linear(state->qkv, &model->qkv, layer, x);
   q = &qkv[0], k = &qkv[EMBED_SIZE], v = &qkv[2*EMBED_SIZE];
-  attn = matmul(state->attn, k,  q, EMBED_SIZE, past_len);
-  attn = scale(attn, (1.0 / sqrt(EMBED_SIZE)), past_len);
-  attn = softmax(attn, past_len);
-  x = matmul(state->attn, v, attn, past_len, EMBED_SIZE);
-  x = linear(state->proj, &model->proj, x);
+  for (int i = 0; i < NUM_HEADS; i++) {
+    attn = matmul(&state->attn[i], &k[i*head_size], &q[i*head_size], head_size, past_len+1);
+    attn = scale(&state->attn[i], (1.0 / sqrt(head_size)), past_len+1);
+    attn = softmax(&state->attn[i], past_len+1);
+    matmul(&state->attn_out[i*head_size], &v[i*head_size], &state->attn[i], past_len+1, EMBED_SIZE);
+  }
+  x = linear(state->proj, &model->proj, layer, state->attn_out);
   return x;
 }
 
 float* mlp(GPT2* model, State* state, int layer, float* x) {
-  x = linear(state->fc1, &model->fc1, x);
-  x = linear(state->fc2, &model->fc2, gelu(x, EMBED_SIZE));
+  x = linear(state->fc1, &model->fc1, layer, x);
+  x = linear(state->fc2, &model->fc2, layer, gelu(x, model->fc1.out_size));
   return x;
 }
 
@@ -166,9 +204,10 @@ float* gpt(GPT2* model, State* state, float* past, int past_len, int token) {
   float* x;
   x = add(state->x, embedding(model->embed_tokens, token), embedding(model->embed_pos, past_len), EMBED_SIZE);
   for (int i = 0; i < NUM_LAYERS; i++) {
-    x = add(state->x, x, attention(model, state, past, past_len, i, norm(x)), EMBED_SIZE);
-    x = add(state->x, x, mlp(model, state, i, norm(x)), EMBED_SIZE);
+    x = add(state->x, x, attention(model, state, past, past_len, i, norm(state->ln1, &model->ln1, i, x)), EMBED_SIZE);
+    x = add(state->x, x, mlp(model, state, i, norm(state->ln2, &model->ln2, i, x)), EMBED_SIZE);
   }
+  x = matmul(state->out, model->fc_out, norm(state->x, &model->ln_out, 0, x), EMBED_SIZE, VOCAB_SIZE);
   return x;
 }
 
@@ -176,15 +215,15 @@ float* gpt(GPT2* model, State* state, float* past, int past_len, int token) {
 // Main
 
 int main() {
-  // deserialize()
   GPT2* model = malloc(sizeof(GPT2));
   State* state = malloc(sizeof(State));
   float* past = malloc(2 * NUM_LAYERS * CONTEXT_SIZE * EMBED_SIZE * sizeof(float));
 
-  init_model(model);
+  FILE* f = fopen("/tmp/weights.bin", "rb");
+  assert(f);
+  init_model(f, model);
   init_state(state);
 
-  int context[512] = {0};
-  gpt(model, state, past, 0, 0);
+  gpt(model, state, past, 0, 1);
   printf("DONE\n");
 }

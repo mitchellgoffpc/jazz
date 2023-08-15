@@ -1,4 +1,5 @@
 import os
+import struct
 import torch
 import requests
 import tiktoken
@@ -10,16 +11,18 @@ if __name__ == '__main__':
   model = 'gpt2'
   weights_url = f'https://huggingface.co/{model}/resolve/main/pytorch_model.bin'
   checkpoint_fn = f'/tmp/{model}.ckpt'
+  tmp_checkpoint_fn = f'{checkpoint_fn}.tmp'
 
   if not os.path.exists(checkpoint_fn):
     r = requests.get(weights_url, stream=True)
     file_size = int(r.headers['content-length'])
     chunk_size = 1000  # 1k for chunk_size, since Ethernet packet size is around 1500 bytes
-    with open(checkpoint_fn, 'wb') as f:
+    with open(tmp_checkpoint_fn, 'wb') as f:
       with tqdm(ncols=100, desc="Fetching " + weights_url, total=file_size, unit_scale=True) as pbar:
         for chunk in r.iter_content(chunk_size=chunk_size):
           f.write(chunk)
           pbar.update(chunk_size)
+    os.rename(tmp_checkpoint_fn, checkpoint_fn)
 
   state_dict = torch.load(checkpoint_fn)
 
@@ -44,6 +47,32 @@ if __name__ == '__main__':
   state_dict = {k:v for k,v in state_dict.items() if not any(x in k for x in biases)}
   state_dict = {k: v.transpose(-1, -2) if any(x in k for x in linears) else v for k,v in state_dict.items()}
   state_dict['fc_out.weight'] = state_dict['embed_tokens.weight']
+
+  print("Serializing weights...")
+
+  def serialize_layer(data):
+    f.write(struct.pack('<Q', data.nelement()))
+    f.write(data.numpy().tobytes())
+
+  def serialize_block(key):
+    serialize_layer(torch.stack([state_dict[f'blocks.{i}.{key}.weight'] for i in range(GPTConfig.num_layers)], dim=0))
+    serialize_layer(torch.stack([state_dict[f'blocks.{i}.{key}.bias'] for i in range(GPTConfig.num_layers)], dim=0))
+
+  with open('/tmp/weights.bin', 'wb') as f:
+    f.write(struct.pack('<Q', len(state_dict)))
+    serialize_layer(state_dict['embed_tokens.weight'])
+    serialize_layer(state_dict['embed_pos.weight'])
+    serialize_block('ln1')
+    serialize_block('ln2')
+    serialize_block('attn.qkv')
+    serialize_block('attn.proj')
+    serialize_block('mlp.fc1')
+    serialize_block('mlp.fc2')
+    serialize_layer(state_dict['ln.weight'])
+    serialize_layer(state_dict['ln.bias'])
+    serialize_layer(state_dict['fc_out.weight'])
+
+  print("Done serializing")
 
   device = 'cpu'
   config = GPTConfig()
