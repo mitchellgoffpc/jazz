@@ -114,13 +114,6 @@ void init_state(State* state) {
 
 // Helper Functions
 
-#define BENCHMARK(n, expr) ({ \
-  clock_t start_time = clock(); \
-  for (int i = 0; i < (n); i++) { expr; } \
-  double elapsed_time = (double)(clock() - start_time) / CLOCKS_PER_SEC; \
-  printf("DONE, %f.2 it/s\n", NUM_SAMPLES / elapsed_time); \
-})
-
 #define ELEMENTWISE(i, n, out, expr) ({ \
   for (int i = 0; i < (n); i++) { out[i] = (expr); } \
   out; \
@@ -243,6 +236,13 @@ float* gpt(GPT2* model, State* state, float* past, int past_len, int token) {
 
 
 // Main
+
+#define BENCHMARK(n, expr) ({ \
+  clock_t start_time = clock(); \
+  for (int i = 0; i < (n); i++) { expr; } \
+  double elapsed_time = (double)(clock() - start_time) / CLOCKS_PER_SEC; \
+  printf("DONE, %f.2 it/s\n", n / elapsed_time); \
+})
 
 int main() {
   GPT2* model = malloc(sizeof(GPT2));
