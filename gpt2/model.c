@@ -5,17 +5,16 @@
 #include <string.h>
 #include <assert.h>
 
-#define NUM_LAYERS 12
-#define NUM_HEADS 12
-#define VOCAB_SIZE 50257
-#define EMBED_SIZE 768
-#define CONTEXT_SIZE 1024
-#define HEAD_SIZE (EMBED_SIZE / NUM_HEADS)
-#define CACHE_SIZE (2 * CONTEXT_SIZE * EMBED_SIZE)
-#define NUM_SAMPLES 10
-
 
 // Definitions
+
+typedef struct {
+  size_t num_layers;
+  size_t num_heads;
+  size_t embed_size;
+  size_t vocab_size;
+  size_t context_size;
+} Config;
 
 typedef struct {
   float* weight;
@@ -31,6 +30,7 @@ typedef struct {
 } Linear;
 
 typedef struct {
+  Config config;
   float* embed_tokens;
   float* embed_pos;
   LayerNorm ln1;
@@ -64,7 +64,7 @@ float* load_layer(FILE* f, int expected_size) {
   size_t layer_size;
   fread(&layer_size, sizeof(size_t), 1, f);
   assert(layer_size == expected_size);
-  float* data = malloc(layer_size*sizeof(float));
+  float* data = malloc(layer_size * sizeof(float));
   fread(data, sizeof(float), layer_size, f);
   return data;
 }
@@ -85,30 +85,32 @@ void init_linear(FILE* f, Linear* layer, int num_layers, int in_size, int out_si
 void init_model(FILE* f, GPT2* model) {
   size_t n_weights, layer_size;
   fread(&n_weights, sizeof(size_t), 1, f);
+  fread(&model->config, sizeof(Config), 1, f);
 
-  model->embed_tokens = load_layer(f, VOCAB_SIZE * EMBED_SIZE);
-  model->embed_pos = load_layer(f, CONTEXT_SIZE * EMBED_SIZE);
-  init_layernorm(f, &model->ln1, NUM_LAYERS, EMBED_SIZE);
-  init_layernorm(f, &model->ln2, NUM_LAYERS, EMBED_SIZE);
-  init_linear(f, &model->qkv, NUM_LAYERS,  EMBED_SIZE, 3*EMBED_SIZE);
-  init_linear(f, &model->proj, NUM_LAYERS, EMBED_SIZE, EMBED_SIZE);
-  init_linear(f, &model->fc1, NUM_LAYERS, EMBED_SIZE, 4*EMBED_SIZE);
-  init_linear(f, &model->fc2, NUM_LAYERS, 4*EMBED_SIZE, EMBED_SIZE);
-  init_layernorm(f, &model->ln_out, 1, EMBED_SIZE);
-  model->fc_out = load_layer(f, EMBED_SIZE * VOCAB_SIZE);
+  Config cfg = model->config;
+  model->embed_tokens = load_layer(f, cfg.vocab_size * cfg.embed_size);
+  model->embed_pos = load_layer(f, cfg.context_size * cfg.embed_size);
+  init_layernorm(f, &model->ln1, cfg.num_layers, cfg.embed_size);
+  init_layernorm(f, &model->ln2, cfg.num_layers, cfg.embed_size);
+  init_linear(f, &model->qkv, cfg.num_layers,  cfg.embed_size, 3 * cfg.embed_size);
+  init_linear(f, &model->proj, cfg.num_layers, cfg.embed_size, cfg.embed_size);
+  init_linear(f, &model->fc1, cfg.num_layers, cfg.embed_size, 4 * cfg.embed_size);
+  init_linear(f, &model->fc2, cfg.num_layers, 4 * cfg.embed_size, cfg.embed_size);
+  init_layernorm(f, &model->ln_out, 1, cfg.embed_size);
+  model->fc_out = load_layer(f, cfg.embed_size * cfg.vocab_size);
 }
 
-void init_state(State* state) {
-  state->x = malloc(EMBED_SIZE * sizeof(float));
-  state->ln1 = malloc(EMBED_SIZE * sizeof(float));
-  state->qkv = malloc(3*EMBED_SIZE * sizeof(float));
-  state->attn = malloc(CONTEXT_SIZE * sizeof(float));
-  state->attn_out = malloc(EMBED_SIZE * sizeof(float));
-  state->proj = malloc(EMBED_SIZE * sizeof(float));
-  state->ln2 = malloc(EMBED_SIZE * sizeof(float));
-  state->fc1 = malloc(4*EMBED_SIZE * sizeof(float));
-  state->fc2 = malloc(EMBED_SIZE * sizeof(float));
-  state->out = malloc(EMBED_SIZE * sizeof(float));
+void init_state(State* state, Config cfg) {
+  state->x = malloc(cfg.embed_size * sizeof(float));
+  state->ln1 = malloc(cfg.embed_size * sizeof(float));
+  state->qkv = malloc(3 * cfg.embed_size * sizeof(float));
+  state->attn = malloc(cfg.context_size * sizeof(float));
+  state->attn_out = malloc(cfg.embed_size * sizeof(float));
+  state->proj = malloc(cfg.embed_size * sizeof(float));
+  state->ln2 = malloc(cfg.embed_size * sizeof(float));
+  state->fc1 = malloc(4 * cfg.embed_size * sizeof(float));
+  state->fc2 = malloc(cfg.embed_size * sizeof(float));
+  state->out = malloc(cfg.vocab_size * sizeof(float));
 }
 
 
@@ -150,25 +152,25 @@ float max(float* x, int n) {
 
 float* matmul(float* out, float* A, float* X, int n_cols, int n_rows) {
   for (int row = 0; row < n_rows; row++) {
-    out[row] = REDUCE(col, n_cols, acc, acc + A[row*n_cols + col] * X[col]);
+    out[row] = REDUCE(col, n_cols, acc, acc + A[row * n_cols + col] * X[col]);
   }
   return out;
 }
 float* matvmul(float* out, float* X, float* A, int n_rows, int n_cols) {
   for (int col = 0; col < n_cols; col++) {
-    out[col] = REDUCE(row, n_rows, acc, acc + X[row] * A[row*n_cols + col]);
+    out[col] = REDUCE(row, n_rows, acc, acc + X[row] * A[row * n_cols + col]);
   }
   return out;
 }
 
 float* linear(float* out, Linear* fc, int layer, float* data) {
-  out = matmul(out, &fc->weight[layer*fc->in_size*fc->out_size], data, fc->in_size, fc->out_size);
-  out = add(out, &fc->bias[layer*fc->out_size], out, fc->out_size);
+  out = matmul(out, &fc->weight[layer * fc->in_size * fc->out_size], data, fc->in_size, fc->out_size);
+  out = add(out, &fc->bias[layer * fc->out_size], out, fc->out_size);
   return out;
 }
 
-float* embedding(float* data, int idx) {
-  return &data[idx*EMBED_SIZE];
+float* embedding(float* data, int idx, int embed_size) {
+  return &data[idx * embed_size];
 }
 
 float* softmax(float* x, int n) {
@@ -189,7 +191,7 @@ float* norm(float* out, LayerNorm* norm, int layer, float* x) {
   float std = sqrt(var) + 1e-5; // epsilon
   for (int i = 0; i < norm->size; i++) {
     out[i] = (x[i] - mean) / std;
-    out[i] = out[i] * norm->weight[layer*norm->size + i] + norm->bias[layer*norm->size + i];
+    out[i] = out[i] * norm->weight[layer * norm->size + i] + norm->bias[layer * norm->size + i];
   }
   return out;
 }
@@ -198,20 +200,22 @@ float* norm(float* out, LayerNorm* norm, int layer, float* x) {
 // Forward pass
 
 float* attention(GPT2* model, State* state, float* past, int past_len, int layer, float* x) {
+  Config cfg = model->config;
+  int head_size = cfg.embed_size / cfg.num_heads;
   float* qkv, *attn, *q, *k, *v;
+
   qkv = linear(state->qkv, &model->qkv, layer, x);
-  q = &qkv[0], k = &qkv[EMBED_SIZE], v = &qkv[2*EMBED_SIZE];
+  q = &qkv[0], k = &qkv[cfg.embed_size], v = &qkv[2 * cfg.embed_size];
+  for (int i = 0; i < cfg.num_heads; i++) {
+    float* k_past = &past[i * cfg.context_size * head_size];
+    float* v_past = &past[(cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size)];
+    memcpy(&k_past[past_len * head_size], &k[i * head_size], head_size * sizeof(float));
+    memcpy(&v_past[past_len * head_size], &v[i * head_size], head_size * sizeof(float));
 
-  for (int i = 0; i < NUM_HEADS; i++) {
-    float* k_past = &past[i*CONTEXT_SIZE*HEAD_SIZE];
-    float* v_past = &past[NUM_HEADS*CONTEXT_SIZE*HEAD_SIZE + i*CONTEXT_SIZE*HEAD_SIZE];
-    memcpy(&k_past[past_len*HEAD_SIZE], &k[i*HEAD_SIZE], HEAD_SIZE*sizeof(float));
-    memcpy(&v_past[past_len*HEAD_SIZE], &v[i*HEAD_SIZE], HEAD_SIZE*sizeof(float));
-
-    attn = matmul(state->attn, k_past, &q[i*HEAD_SIZE], HEAD_SIZE, past_len+1);
-    attn = scale(state->attn, (1.0 / sqrt(HEAD_SIZE)), past_len+1);
-    attn = softmax(state->attn, past_len+1);
-    attn = matvmul(&state->attn_out[i*HEAD_SIZE], attn, v_past, past_len+1, HEAD_SIZE);
+    attn = matmul(state->attn, k_past, &q[i * head_size], head_size, past_len + 1);
+    attn = scale(state->attn, (1.0 / sqrt(head_size)), past_len + 1);
+    attn = softmax(state->attn, past_len + 1);
+    attn = matvmul(&state->attn_out[i * head_size], attn, v_past, past_len + 1, head_size);
   }
   x = linear(state->proj, &model->proj, layer, state->attn_out);
   return x;
@@ -224,19 +228,23 @@ float* mlp(GPT2* model, State* state, int layer, float* x) {
 }
 
 float* gpt(GPT2* model, State* state, float* past, int past_len, int token) {
+  Config cfg = model->config;
+  int cache_size = 2 * cfg.context_size * cfg.embed_size;
   float* x;
-  x = add(state->x, embedding(model->embed_tokens, token), embedding(model->embed_pos, past_len), EMBED_SIZE);
-  for (int i = 0; i < NUM_LAYERS; i++) {
-    x = add(state->x, x, attention(model, state, &past[i*CACHE_SIZE], past_len, i, norm(state->ln1, &model->ln1, i, x)), EMBED_SIZE);
-    x = add(state->x, x, mlp(model, state, i, norm(state->ln2, &model->ln2, i, x)), EMBED_SIZE);
+
+  x = add(state->x, embedding(model->embed_tokens, token, cfg.embed_size), embedding(model->embed_pos, past_len, cfg.embed_size), cfg.embed_size);
+  for (int i = 0; i < cfg.num_layers; i++) {
+    x = add(state->x, x, attention(model, state, &past[i * cache_size], past_len, i, norm(state->ln1, &model->ln1, i, x)), cfg.embed_size);
+    x = add(state->x, x, mlp(model, state, i, norm(state->ln2, &model->ln2, i, x)), cfg.embed_size);
   }
-  x = matmul(state->out, model->fc_out, norm(state->x, &model->ln_out, 0, x), EMBED_SIZE, VOCAB_SIZE);
+  x = matmul(state->out, model->fc_out, norm(state->x, &model->ln_out, 0, x), cfg.embed_size, cfg.vocab_size);
   return x;
 }
 
 
 // Main
 
+#define NUM_SAMPLES 50
 #define BENCHMARK(n, expr) ({ \
   clock_t start_time = clock(); \
   for (int i = 0; i < (n); i++) { expr; } \
@@ -247,22 +255,23 @@ float* gpt(GPT2* model, State* state, float* past, int past_len, int token) {
 int main() {
   GPT2* model = malloc(sizeof(GPT2));
   State* state = malloc(sizeof(State));
-  float* past = malloc(2 * NUM_LAYERS * CONTEXT_SIZE * EMBED_SIZE * sizeof(float));
 
   FILE* f = fopen("/tmp/weights.bin", "rb");
   assert(f);
   init_model(f, model);
-  init_state(state);
+  init_state(state, model->config);
+  Config cfg = model->config;
 
   // The capital of Germany is Berlin. The capital of France is ...
   printf("TESTING...\n");
+  float* past = malloc(2 * cfg.num_layers * cfg.context_size * cfg.embed_size * sizeof(float));
   int tokens[12] = {464, 3139, 286, 4486, 318, 11307, 13, 383, 3139, 286, 4881, 318};
   for (int i = 0; i < 12; i++) {
     gpt(model, state, past, i, tokens[i]);
   }
 
   int argmax = 0;
-  for (int i = 0; i < VOCAB_SIZE; i++) {
+  for (int i = 0; i < cfg.vocab_size; i++) {
     argmax = state->out[i] > state->out[argmax] ? i : argmax;
   }
   assert(argmax == 6342);  // Paris
@@ -271,6 +280,6 @@ int main() {
   printf("BENCHMARKING, T=1...\n");
   BENCHMARK(NUM_SAMPLES, gpt(model, state, past, 0, 0));
 
-  printf("BENCHMARKING, T=%d...\n", CONTEXT_SIZE);
-  BENCHMARK(NUM_SAMPLES, gpt(model, state, past, CONTEXT_SIZE-1, 0));
+  printf("BENCHMARKING, T=%lu...\n", cfg.context_size);
+  BENCHMARK(NUM_SAMPLES, gpt(model, state, past, cfg.context_size-1, 0));
 }

@@ -1,4 +1,4 @@
-CC = gcc
+CC = clang
 
 .PHONY: gpt2
 gpt2: gpt2/model.c

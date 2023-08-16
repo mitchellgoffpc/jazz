@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os
+import sys
 import json
 import struct
 import torch
@@ -55,7 +56,7 @@ def fix_state_dict(state_dict):
   state_dict['fc_out.weight'] = state_dict['embed_tokens.weight']
   return state_dict
 
-def serialize_weights(state_dict, output_fn):
+def serialize_model(config, state_dict, output_fn):
   def serialize_layer(data):
     f.write(struct.pack('<Q', data.nelement()))
     f.write(data.numpy().tobytes())
@@ -66,6 +67,8 @@ def serialize_weights(state_dict, output_fn):
 
   with open(output_fn, 'wb') as f:
     f.write(struct.pack('<Q', len(state_dict)))
+    f.write(struct.pack('<5Q', config.num_layers, config.num_heads, config.embed_size, config.vocab_size, config.context_size))
+
     serialize_layer(state_dict['embed_tokens.weight'])
     serialize_layer(state_dict['embed_pos.weight'])
     serialize_block('ln1')
@@ -80,9 +83,15 @@ def serialize_weights(state_dict, output_fn):
 
 
 
+CONFIGS = {
+  'gpt2': GPTConfig(num_layers=12, num_heads=12, embed_size=768),
+  'gpt2-medium': GPTConfig(num_layers=24, num_heads=16, embed_size=1024)}
+
 if __name__ == '__main__':
+  model = sys.argv[1]
+  assert model in CONFIGS
+
   # Load weights
-  model = 'gpt2'
   weights_url = f'https://huggingface.co/{model}/resolve/main/model.safetensors'
   checkpoint_fn = f'/tmp/{model}.safetensors'
   state_dict = load_checkpoint(weights_url, checkpoint_fn)
@@ -90,7 +99,7 @@ if __name__ == '__main__':
 
   # Create the model
   device = 'cpu'
-  config = GPTConfig()
+  config = CONFIGS[model]
   model = GPT(config).to(device)
   model.load_state_dict(state_dict)
   tokenizer = tiktoken.get_encoding("gpt2")
@@ -109,7 +118,7 @@ if __name__ == '__main__':
 
   # Serialize weights
   print("Serializing weights...")
-  serialize_weights(state_dict, '/tmp/weights.bin')
+  serialize_model(config, state_dict, '/tmp/weights.bin')
   print("Done serializing")
 
   # Benchmark
