@@ -1,4 +1,5 @@
 #include <math.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #define CONTEXT_SIZE 1024
 #define HEAD_SIZE (EMBED_SIZE / NUM_HEADS)
 #define CACHE_SIZE (2 * CONTEXT_SIZE * EMBED_SIZE)
+#define NUM_SAMPLES 10
 
 
 // Definitions
@@ -112,8 +114,22 @@ void init_state(State* state) {
 
 // Helper Functions
 
-#define ELEMENTWISE(i, n, out, expr) ({ for (int i = 0; i < (n); i++) { out[i] = (expr); } out; })
-#define REDUCE(i, n, acc, expr) ({ float acc = 0; for (int i = 0; i < (n); i++) { acc = (expr); } acc; })
+#define BENCHMARK(n, expr) ({ \
+  clock_t start_time = clock(); \
+  for (int i = 0; i < (n); i++) { expr; } \
+  double elapsed_time = (double)(clock() - start_time) / CLOCKS_PER_SEC; \
+  printf("DONE, %f.2 it/s\n", NUM_SAMPLES / elapsed_time); \
+})
+
+#define ELEMENTWISE(i, n, out, expr) ({ \
+  for (int i = 0; i < (n); i++) { out[i] = (expr); } \
+  out; \
+})
+#define REDUCE(i, n, acc, expr) ({ \
+  float acc = 0; \
+  for (int i = 0; i < (n); i++) { acc = (expr); } \
+  acc; \
+})
 
 float* add(float* out, float* x, float* y, int n) {
   return ELEMENTWISE(i, n, out, x[i] + y[i]);
@@ -239,6 +255,7 @@ int main() {
   init_state(state);
 
   // The capital of Germany is Berlin. The capital of France is ...
+  printf("TESTING...\n");
   int tokens[12] = {464, 3139, 286, 4486, 318, 11307, 13, 383, 3139, 286, 4881, 318};
   for (int i = 0; i < 12; i++) {
     gpt(model, state, past, i, tokens[i]);
@@ -250,4 +267,10 @@ int main() {
   }
   assert(argmax == 6342);  // Paris
   printf("DONE\n");
+
+  printf("BENCHMARKING, T=1...\n");
+  BENCHMARK(NUM_SAMPLES, gpt(model, state, past, 0, 0));
+
+  printf("BENCHMARKING, T=%d...\n", CONTEXT_SIZE);
+  BENCHMARK(NUM_SAMPLES, gpt(model, state, past, CONTEXT_SIZE-1, 0));
 }
