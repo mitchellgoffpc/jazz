@@ -1,9 +1,9 @@
 CC = gcc
 
-.PHONY: run
-run: model.c
-	$(CC) model.c -O3 -lm -o model.a
+.PHONY: gpt2
+gpt2: gpt2/model.c
+	$(CC) gpt2/model.c -O3 -lm -o gpt2/run
 
-.PHONY: runfast
-runfast: model.c
-	$(CC) model.c -Ofast -lm -o model.a
+.PHONY: gpt2fast
+gpt2fast: gpt2/model.c
+	$(CC) gpt2/model.c -Ofast -lm -o gpt2/run
