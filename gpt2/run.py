@@ -1,4 +1,6 @@
+#!/usr/bin/env python
 import os
+import json
 import struct
 import torch
 import requests
@@ -19,7 +21,17 @@ def load_checkpoint(weights_url, checkpoint_fn):
           pbar.update(chunk_size)
     os.rename(tmp_checkpoint_fn, checkpoint_fn)
 
-  return torch.load(checkpoint_fn)
+  with open(checkpoint_fn, 'rb') as f:
+    header_len, = struct.unpack('<Q', f.read(8))
+    metadata = json.loads(f.read(header_len))
+    tensor_data = bytearray(f.read()).copy()
+    state_dict = {}
+    for k,v in metadata.items():
+      if k != '__metadata__':
+        s, e = v['data_offsets']
+        state_dict[k] = torch.frombuffer(tensor_data[s:e], dtype=torch.float32).view(v['shape'])
+    return state_dict
+
 
 def fix_state_dict(state_dict):
   replacements = {
@@ -71,8 +83,8 @@ def serialize_weights(state_dict, output_fn):
 if __name__ == '__main__':
   # Load weights
   model = 'gpt2'
-  weights_url = f'https://huggingface.co/{model}/resolve/main/pytorch_model.bin'
-  checkpoint_fn = f'/tmp/{model}.ckpt'
+  weights_url = f'https://huggingface.co/{model}/resolve/main/model.safetensors'
+  checkpoint_fn = f'/tmp/{model}.safetensors'
   state_dict = load_checkpoint(weights_url, checkpoint_fn)
   state_dict = fix_state_dict(state_dict)
 
