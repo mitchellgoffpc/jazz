@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
+
 #ifdef __APPLE__
 #include <OpenCL/cl.h>
 #else
@@ -7,6 +9,15 @@
 #endif
 
 #define VECTOR_SIZE 1024
+
+#define CL_CHECK(_expr) assert((_expr) == CL_SUCCESS);
+#define CL_CHECK_ERR(_expr) ({       \
+  cl_int err = CL_INVALID_VALUE;     \
+  __typeof__(_expr) _ret = _expr;    \
+  assert(_ret && err == CL_SUCCESS); \
+  _ret;                              \
+})
+
 
 const char *saxpy_kernel =
 "__kernel                                    \n"
@@ -21,8 +32,6 @@ const char *saxpy_kernel =
 
 
 int main() {
-  cl_int clStatus;
-
   // Create vectors A, B and C
   float alpha = 2.0;
   float* A = (float*)malloc(sizeof(float)*VECTOR_SIZE);
@@ -34,55 +43,51 @@ int main() {
     C[i] = 0;
   }
 
-  // Get platform and device information
+  // Create a CL context
   cl_uint num_platforms;
-  clStatus = clGetPlatformIDs(0, NULL, &num_platforms);
+  CL_CHECK(clGetPlatformIDs(0, NULL, &num_platforms));
   cl_platform_id* platforms = malloc(num_platforms * sizeof(cl_platform_id));
-  clStatus = clGetPlatformIDs(num_platforms, platforms, NULL);
+  CL_CHECK(clGetPlatformIDs(num_platforms, platforms, NULL));
 
-  // Get the devices list and choose the device you want to run on
   cl_uint num_devices;
-  clStatus = clGetDeviceIDs(platforms[0], CL_DEVICE_TYPE_GPU, 0, NULL, &num_devices);
+  CL_CHECK(clGetDeviceIDs(platforms[0], CL_DEVICE_TYPE_GPU, 0, NULL, &num_devices));
   cl_device_id* device_list = malloc(num_devices * sizeof(cl_device_id));
-  clStatus = clGetDeviceIDs(platforms[0], CL_DEVICE_TYPE_GPU, num_devices, device_list, NULL);
+  CL_CHECK(clGetDeviceIDs(platforms[0], CL_DEVICE_TYPE_GPU, num_devices, device_list, NULL));
 
-  // Create a CL context for the device
-  cl_context context = clCreateContext(NULL, num_devices, device_list, NULL, NULL, &clStatus);
-
-  // Create a command queue
-  cl_command_queue command_queue = clCreateCommandQueue(context, device_list[0], 0, &clStatus);
+  cl_context context = CL_CHECK_ERR(clCreateContext(NULL, num_devices, device_list, NULL, NULL, &err));
+  cl_command_queue command_queue = CL_CHECK_ERR(clCreateCommandQueue(context, device_list[0], 0, &err));
 
   // Create memory buffers on the device for each vector
-  cl_mem A_clmem = clCreateBuffer(context, CL_MEM_READ_ONLY, VECTOR_SIZE * sizeof(float), NULL, &clStatus);
-  cl_mem B_clmem = clCreateBuffer(context, CL_MEM_READ_ONLY, VECTOR_SIZE * sizeof(float), NULL, &clStatus);
-  cl_mem C_clmem = clCreateBuffer(context, CL_MEM_WRITE_ONLY, VECTOR_SIZE * sizeof(float), NULL, &clStatus);
+  cl_mem A_clmem = CL_CHECK_ERR(clCreateBuffer(context, CL_MEM_READ_ONLY, VECTOR_SIZE * sizeof(float), NULL, &err));
+  cl_mem B_clmem = CL_CHECK_ERR(clCreateBuffer(context, CL_MEM_READ_ONLY, VECTOR_SIZE * sizeof(float), NULL, &err));
+  cl_mem C_clmem = CL_CHECK_ERR(clCreateBuffer(context, CL_MEM_WRITE_ONLY, VECTOR_SIZE * sizeof(float), NULL, &err));
 
   // Copy A and B to the device
-  clStatus = clEnqueueWriteBuffer(command_queue, A_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), A, 0, NULL, NULL);
-  clStatus = clEnqueueWriteBuffer(command_queue, B_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), B, 0, NULL, NULL);
+  CL_CHECK(clEnqueueWriteBuffer(command_queue, A_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), A, 0, NULL, NULL));
+  CL_CHECK(clEnqueueWriteBuffer(command_queue, B_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), B, 0, NULL, NULL));
 
   // Create a program and kernel from the source
-  cl_program program = clCreateProgramWithSource(context, 1,(const char **)&saxpy_kernel, NULL, &clStatus);
-  clStatus = clBuildProgram(program, 1, device_list, NULL, NULL, NULL);
-  cl_kernel kernel = clCreateKernel(program, "saxpy_kernel", &clStatus);
+  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(context, 1,(const char **)&saxpy_kernel, NULL, &err));
+  CL_CHECK(clBuildProgram(program, 1, device_list, NULL, NULL, NULL));
+  cl_kernel kernel = CL_CHECK_ERR(clCreateKernel(program, "saxpy_kernel", &err));
 
   // Set the kernel arguments
-  clStatus = clSetKernelArg(kernel, 0, sizeof(float), &alpha);
-  clStatus = clSetKernelArg(kernel, 1, sizeof(cl_mem), &A_clmem);
-  clStatus = clSetKernelArg(kernel, 2, sizeof(cl_mem), &B_clmem);
-  clStatus = clSetKernelArg(kernel, 3, sizeof(cl_mem), &C_clmem);
+  CL_CHECK(clSetKernelArg(kernel, 0, sizeof(float), &alpha));
+  CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &A_clmem));
+  CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &B_clmem));
+  CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &C_clmem));
 
   // Execute the kernel
   size_t global_size = VECTOR_SIZE;
   size_t local_size = 64;
-  clStatus = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
+  CL_CHECK(clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL));
 
   // Copy C to the host
-  clStatus = clEnqueueReadBuffer(command_queue, C_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), C, 0, NULL, NULL);
+  CL_CHECK(clEnqueueReadBuffer(command_queue, C_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), C, 0, NULL, NULL));
 
   // Clean up and wait for all the comands to complete
-  clStatus = clFlush(command_queue);
-  clStatus = clFinish(command_queue);
+  CL_CHECK(clFlush(command_queue));
+  CL_CHECK(clFinish(command_queue));
 
   // Display the result
   for (int i = 0; i < VECTOR_SIZE; i++) {
@@ -90,13 +95,13 @@ int main() {
   }
 
   // Release all allocated objects and host buffers
-  clStatus = clReleaseKernel(kernel);
-  clStatus = clReleaseProgram(program);
-  clStatus = clReleaseMemObject(A_clmem);
-  clStatus = clReleaseMemObject(B_clmem);
-  clStatus = clReleaseMemObject(C_clmem);
-  clStatus = clReleaseCommandQueue(command_queue);
-  clStatus = clReleaseContext(context);
+  CL_CHECK(clReleaseKernel(kernel));
+  CL_CHECK(clReleaseProgram(program));
+  CL_CHECK(clReleaseMemObject(A_clmem));
+  CL_CHECK(clReleaseMemObject(B_clmem));
+  CL_CHECK(clReleaseMemObject(C_clmem));
+  CL_CHECK(clReleaseCommandQueue(command_queue));
+  CL_CHECK(clReleaseContext(context));
   free(A);
   free(B);
   free(C);
