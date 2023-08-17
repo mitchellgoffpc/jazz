@@ -19,6 +19,99 @@
 })
 
 
+// Definitions
+
+typedef struct {
+  size_t num_layers;
+  size_t num_heads;
+  size_t embed_size;
+  size_t vocab_size;
+  size_t context_size;
+} Config;
+
+typedef struct {
+  cl_mem weight;
+  cl_mem bias;
+  int size;
+} LayerNorm;
+
+typedef struct {
+  cl_mem weight;
+  cl_mem bias;
+  int in_size;
+  int out_size;
+} Linear;
+
+typedef struct {
+  Config config;
+  cl_mem embed_tokens;
+  cl_mem embed_pos;
+  LayerNorm ln1;
+  LayerNorm ln2;
+  Linear qkv;
+  Linear proj;
+  Linear fc1;
+  Linear fc2;
+  LayerNorm ln_out;
+  cl_mem fc_out;
+} GPT2;
+
+typedef struct {
+  cl_mem past;
+  cl_mem x;
+  cl_mem ln1;
+  cl_mem qkv;
+  cl_mem attn;
+  cl_mem attn_out;
+  cl_mem proj;
+  cl_mem ln2;
+  cl_mem fc1;
+  cl_mem fc2;
+  cl_mem out;
+} State;
+
+typedef struct {
+  cl_platform_id* platforms;
+  cl_device_id* devices;
+  cl_context context;
+  cl_command_queue command_queue;
+} CL;
+
+
+// Initialization
+
+void init_cl(CL* cl) {
+  cl_uint num_platforms, num_devices;
+
+  CL_CHECK(clGetPlatformIDs(0, NULL, &num_platforms));
+  cl->platforms = malloc(num_platforms * sizeof(cl_platform_id));
+  CL_CHECK(clGetPlatformIDs(num_platforms, cl->platforms, NULL));
+
+  CL_CHECK(clGetDeviceIDs(cl->platforms[0], CL_DEVICE_TYPE_GPU, 0, NULL, &num_devices));
+  cl->devices = malloc(num_devices * sizeof(cl_device_id));
+  CL_CHECK(clGetDeviceIDs(cl->platforms[0], CL_DEVICE_TYPE_GPU, num_devices, cl->devices, NULL));
+
+  cl->context = CL_CHECK_ERR(clCreateContext(NULL, num_devices, cl->devices, NULL, NULL, &err));
+  cl->command_queue = CL_CHECK_ERR(clCreateCommandQueue(cl->context, cl->devices[0], 0, &err));
+}
+
+cl_mem init_cl_buffer(CL* cl, int mode, float* buf, size_t size) {
+  cl_mem cl_buf = CL_CHECK_ERR(clCreateBuffer(cl->context, mode, size * sizeof(float), NULL, &err));
+  if (buf) CL_CHECK(clEnqueueWriteBuffer(cl->command_queue, cl_buf, CL_TRUE, 0, size * sizeof(float), buf, 0, NULL, NULL));
+  return cl_buf;
+}
+
+
+// Cleanup
+
+void free_cl(CL* cl) {
+  CL_CHECK(clReleaseCommandQueue(cl->command_queue));
+  CL_CHECK(clReleaseContext(cl->context));
+  free(cl->platforms);
+  free(cl->devices);
+}
+
+
 const char *saxpy_kernel =
 "__kernel                                    \n"
 "void saxpy_kernel(float alpha,              \n"
@@ -34,9 +127,9 @@ const char *saxpy_kernel =
 int main() {
   // Create vectors A, B and C
   float alpha = 2.0;
-  float* A = (float*)malloc(sizeof(float)*VECTOR_SIZE);
-  float* B = (float*)malloc(sizeof(float)*VECTOR_SIZE);
-  float* C = (float*)malloc(sizeof(float)*VECTOR_SIZE);
+  float* A = malloc(VECTOR_SIZE * sizeof(float));
+  float* B = malloc(VECTOR_SIZE * sizeof(float));
+  float* C = malloc(VECTOR_SIZE * sizeof(float));
   for (int i = 0; i < VECTOR_SIZE; i++) {
     A[i] = i;
     B[i] = VECTOR_SIZE - i;
@@ -44,31 +137,17 @@ int main() {
   }
 
   // Create a CL context
-  cl_uint num_platforms;
-  CL_CHECK(clGetPlatformIDs(0, NULL, &num_platforms));
-  cl_platform_id* platforms = malloc(num_platforms * sizeof(cl_platform_id));
-  CL_CHECK(clGetPlatformIDs(num_platforms, platforms, NULL));
-
-  cl_uint num_devices;
-  CL_CHECK(clGetDeviceIDs(platforms[0], CL_DEVICE_TYPE_GPU, 0, NULL, &num_devices));
-  cl_device_id* device_list = malloc(num_devices * sizeof(cl_device_id));
-  CL_CHECK(clGetDeviceIDs(platforms[0], CL_DEVICE_TYPE_GPU, num_devices, device_list, NULL));
-
-  cl_context context = CL_CHECK_ERR(clCreateContext(NULL, num_devices, device_list, NULL, NULL, &err));
-  cl_command_queue command_queue = CL_CHECK_ERR(clCreateCommandQueue(context, device_list[0], 0, &err));
+  CL cl;
+  init_cl(&cl);
 
   // Create memory buffers on the device for each vector
-  cl_mem A_clmem = CL_CHECK_ERR(clCreateBuffer(context, CL_MEM_READ_ONLY, VECTOR_SIZE * sizeof(float), NULL, &err));
-  cl_mem B_clmem = CL_CHECK_ERR(clCreateBuffer(context, CL_MEM_READ_ONLY, VECTOR_SIZE * sizeof(float), NULL, &err));
-  cl_mem C_clmem = CL_CHECK_ERR(clCreateBuffer(context, CL_MEM_WRITE_ONLY, VECTOR_SIZE * sizeof(float), NULL, &err));
-
-  // Copy A and B to the device
-  CL_CHECK(clEnqueueWriteBuffer(command_queue, A_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), A, 0, NULL, NULL));
-  CL_CHECK(clEnqueueWriteBuffer(command_queue, B_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), B, 0, NULL, NULL));
+  cl_mem A_clmem = init_cl_buffer(&cl, CL_MEM_READ_ONLY, A, VECTOR_SIZE);
+  cl_mem B_clmem = init_cl_buffer(&cl, CL_MEM_READ_ONLY, B, VECTOR_SIZE);
+  cl_mem C_clmem = init_cl_buffer(&cl, CL_MEM_WRITE_ONLY, NULL, VECTOR_SIZE);
 
   // Create a program and kernel from the source
-  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(context, 1,(const char **)&saxpy_kernel, NULL, &err));
-  CL_CHECK(clBuildProgram(program, 1, device_list, NULL, NULL, NULL));
+  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(cl.context, 1,(const char **)&saxpy_kernel, NULL, &err));
+  CL_CHECK(clBuildProgram(program, 1, cl.devices, NULL, NULL, NULL));
   cl_kernel kernel = CL_CHECK_ERR(clCreateKernel(program, "saxpy_kernel", &err));
 
   // Set the kernel arguments
@@ -80,14 +159,14 @@ int main() {
   // Execute the kernel
   size_t global_size = VECTOR_SIZE;
   size_t local_size = 64;
-  CL_CHECK(clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL));
+  CL_CHECK(clEnqueueNDRangeKernel(cl.command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL));
 
-  // Copy C to the host
-  CL_CHECK(clEnqueueReadBuffer(command_queue, C_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), C, 0, NULL, NULL));
+  // Copy result to the host
+  CL_CHECK(clEnqueueReadBuffer(cl.command_queue, C_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), C, 0, NULL, NULL));
 
   // Clean up and wait for all the comands to complete
-  CL_CHECK(clFlush(command_queue));
-  CL_CHECK(clFinish(command_queue));
+  CL_CHECK(clFlush(cl.command_queue));
+  CL_CHECK(clFinish(cl.command_queue));
 
   // Display the result
   for (int i = 0; i < VECTOR_SIZE; i++) {
@@ -100,11 +179,8 @@ int main() {
   CL_CHECK(clReleaseMemObject(A_clmem));
   CL_CHECK(clReleaseMemObject(B_clmem));
   CL_CHECK(clReleaseMemObject(C_clmem));
-  CL_CHECK(clReleaseCommandQueue(command_queue));
-  CL_CHECK(clReleaseContext(context));
+  free_cl(&cl);
   free(A);
   free(B);
   free(C);
-  free(platforms);
-  free(device_list);
 }
