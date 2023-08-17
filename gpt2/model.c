@@ -157,8 +157,11 @@ float* matmul(float* out, float* A, float* X, int n_cols, int n_rows) {
   return out;
 }
 float* matvmul(float* out, float* X, float* A, int n_rows, int n_cols) {
-  for (int col = 0; col < n_cols; col++) {
-    out[col] = REDUCE(row, n_rows, acc, acc + X[row] * A[row * n_cols + col]);
+  memset(out, 0, n_cols*sizeof(float));
+  for (int row = 0; row < n_rows; row++) {
+    for (int col = 0; col < n_cols; col++) {
+      out[col] += X[row] * A[row * n_cols + col];
+    }
   }
   return out;
 }
