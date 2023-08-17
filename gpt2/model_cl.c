@@ -78,7 +78,7 @@ typedef struct {
 } CL;
 
 
-// Initialization
+// CL Initialization
 
 void init_cl(CL* cl) {
   cl_uint num_platforms, num_devices;
@@ -95,10 +95,68 @@ void init_cl(CL* cl) {
   cl->command_queue = CL_CHECK_ERR(clCreateCommandQueue(cl->context, cl->devices[0], 0, &err));
 }
 
-cl_mem init_cl_buffer(CL* cl, int mode, float* buf, size_t size) {
+cl_mem init_cl_buffer(CL* cl, float* buf, size_t size, int mode) {
   cl_mem cl_buf = CL_CHECK_ERR(clCreateBuffer(cl->context, mode, size * sizeof(float), NULL, &err));
   if (buf) CL_CHECK(clEnqueueWriteBuffer(cl->command_queue, cl_buf, CL_TRUE, 0, size * sizeof(float), buf, 0, NULL, NULL));
   return cl_buf;
+}
+
+
+// Model Initialization
+
+cl_mem load_layer(FILE* f, CL* cl, int expected_size) {
+  size_t layer_size;
+  fread(&layer_size, sizeof(size_t), 1, f);
+  assert(layer_size == expected_size);
+  float* data = malloc(layer_size * sizeof(float));
+  fread(data, sizeof(float), layer_size, f);
+  cl_mem cl_data = init_cl_buffer(cl, data, layer_size, CL_MEM_READ_ONLY);
+  free(data);
+  return cl_data;
+}
+
+void init_layernorm(FILE* f, CL* cl, LayerNorm* norm, int num_layers, int size) {
+  norm->weight = load_layer(f, cl, num_layers * size);
+  norm->bias = load_layer(f, cl, num_layers * size);
+  norm->size = size;
+}
+
+void init_linear(FILE* f, CL* cl, Linear* layer, int num_layers, int in_size, int out_size) {
+  layer->weight = load_layer(f, cl, num_layers * in_size * out_size);
+  layer->bias = load_layer(f, cl, num_layers * out_size);
+  layer->in_size = in_size;
+  layer->out_size = out_size;
+}
+
+void init_model(FILE* f, CL* cl, GPT2* model) {
+  size_t n_weights, layer_size;
+  fread(&n_weights, sizeof(size_t), 1, f);
+  fread(&model->config, sizeof(Config), 1, f);
+
+  Config cfg = model->config;
+  model->embed_tokens = load_layer(f, cl, cfg.vocab_size * cfg.embed_size);
+  model->embed_pos = load_layer(f, cl, cfg.context_size * cfg.embed_size);
+  init_layernorm(f, cl, &model->ln1, cfg.num_layers, cfg.embed_size);
+  init_layernorm(f, cl, &model->ln2, cfg.num_layers, cfg.embed_size);
+  init_linear(f, cl, &model->qkv, cfg.num_layers,  cfg.embed_size, 3 * cfg.embed_size);
+  init_linear(f, cl, &model->proj, cfg.num_layers, cfg.embed_size, cfg.embed_size);
+  init_linear(f, cl, &model->fc1, cfg.num_layers, cfg.embed_size, 4 * cfg.embed_size);
+  init_linear(f, cl, &model->fc2, cfg.num_layers, 4 * cfg.embed_size, cfg.embed_size);
+  init_layernorm(f, cl, &model->ln_out, 1, cfg.embed_size);
+  model->fc_out = load_layer(f, cl, cfg.embed_size * cfg.vocab_size);
+}
+
+void init_state(CL* cl, State* state, Config cfg) {
+  state->x = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->ln1 = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->qkv = init_cl_buffer(cl, NULL, 3 * cfg.embed_size, CL_MEM_READ_WRITE);
+  state->attn = init_cl_buffer(cl, NULL, cfg.context_size, CL_MEM_READ_WRITE);
+  state->attn_out = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->proj = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->ln2 = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->fc1 = init_cl_buffer(cl, NULL, 4 * cfg.embed_size, CL_MEM_READ_WRITE);
+  state->fc2 = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->out = init_cl_buffer(cl, NULL, cfg.vocab_size, CL_MEM_READ_WRITE);
 }
 
 
@@ -125,6 +183,18 @@ const char *saxpy_kernel =
 
 
 int main() {
+  CL* cl = malloc(sizeof(CL));
+  GPT2* model = malloc(sizeof(GPT2));
+  State* state = malloc(sizeof(State));
+
+  FILE* f = fopen("/tmp/weights.bin", "rb");
+  if (!f) { fprintf(stderr, "Couldn't open file /tmp/weights.bin\n"); return 1; }
+  init_cl(cl);
+  init_model(f, cl, model);
+  init_state(cl, state, model->config);
+  fclose(f);
+  Config cfg = model->config;
+
   // Create vectors A, B and C
   float alpha = 2.0;
   float* A = malloc(VECTOR_SIZE * sizeof(float));
@@ -136,18 +206,14 @@ int main() {
     C[i] = 0;
   }
 
-  // Create a CL context
-  CL cl;
-  init_cl(&cl);
-
   // Create memory buffers on the device for each vector
-  cl_mem A_clmem = init_cl_buffer(&cl, CL_MEM_READ_ONLY, A, VECTOR_SIZE);
-  cl_mem B_clmem = init_cl_buffer(&cl, CL_MEM_READ_ONLY, B, VECTOR_SIZE);
-  cl_mem C_clmem = init_cl_buffer(&cl, CL_MEM_WRITE_ONLY, NULL, VECTOR_SIZE);
+  cl_mem A_clmem = init_cl_buffer(cl, A, VECTOR_SIZE, CL_MEM_READ_ONLY);
+  cl_mem B_clmem = init_cl_buffer(cl, B, VECTOR_SIZE, CL_MEM_READ_ONLY);
+  cl_mem C_clmem = init_cl_buffer(cl, NULL, VECTOR_SIZE, CL_MEM_WRITE_ONLY);
 
   // Create a program and kernel from the source
-  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(cl.context, 1,(const char **)&saxpy_kernel, NULL, &err));
-  CL_CHECK(clBuildProgram(program, 1, cl.devices, NULL, NULL, NULL));
+  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(cl->context, 1,(const char **)&saxpy_kernel, NULL, &err));
+  CL_CHECK(clBuildProgram(program, 1, cl->devices, NULL, NULL, NULL));
   cl_kernel kernel = CL_CHECK_ERR(clCreateKernel(program, "saxpy_kernel", &err));
 
   // Set the kernel arguments
@@ -159,14 +225,14 @@ int main() {
   // Execute the kernel
   size_t global_size = VECTOR_SIZE;
   size_t local_size = 64;
-  CL_CHECK(clEnqueueNDRangeKernel(cl.command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL));
 
   // Copy result to the host
-  CL_CHECK(clEnqueueReadBuffer(cl.command_queue, C_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), C, 0, NULL, NULL));
+  CL_CHECK(clEnqueueReadBuffer(cl->command_queue, C_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), C, 0, NULL, NULL));
 
   // Clean up and wait for all the comands to complete
-  CL_CHECK(clFlush(cl.command_queue));
-  CL_CHECK(clFinish(cl.command_queue));
+  CL_CHECK(clFlush(cl->command_queue));
+  CL_CHECK(clFinish(cl->command_queue));
 
   // Display the result
   for (int i = 0; i < VECTOR_SIZE; i++) {
@@ -179,7 +245,7 @@ int main() {
   CL_CHECK(clReleaseMemObject(A_clmem));
   CL_CHECK(clReleaseMemObject(B_clmem));
   CL_CHECK(clReleaseMemObject(C_clmem));
-  free_cl(&cl);
+  free_cl(cl);
   free(A);
   free(B);
   free(C);

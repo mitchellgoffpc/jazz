@@ -260,9 +260,10 @@ int main() {
   State* state = malloc(sizeof(State));
 
   FILE* f = fopen("/tmp/weights.bin", "rb");
-  assert(f);
+  if (!f) { fprintf(stderr, "Couldn't open file /tmp/weights.bin\n"); return 1; }
   init_model(f, model);
   init_state(state, model->config);
+  fclose(f);
   Config cfg = model->config;
 
   // The capital of Germany is Berlin. The capital of France is ...
