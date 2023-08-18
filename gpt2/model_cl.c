@@ -184,18 +184,14 @@ int main() {
   Config cfg = model->config;
 
   // Create vectors A, B and C
-  float alpha = 2.0;
-  float* A = malloc(VECTOR_SIZE * sizeof(float));
+  float* A = malloc(VECTOR_SIZE * VECTOR_SIZE * sizeof(float));
   float* B = malloc(VECTOR_SIZE * sizeof(float));
   float* C = malloc(VECTOR_SIZE * sizeof(float));
-  for (int i = 0; i < VECTOR_SIZE; i++) {
-    A[i] = i;
-    B[i] = VECTOR_SIZE - i;
-    C[i] = 0;
-  }
+  for (int i = 0; i < VECTOR_SIZE*VECTOR_SIZE; i++) { A[i] = 1.0; }
+  for (int i = 0; i < VECTOR_SIZE; i++) { B[i] = 1.0/1024; }
 
   // Create memory buffers on the device for each vector
-  cl_mem A_clmem = init_cl_buffer(cl, A, VECTOR_SIZE, CL_MEM_READ_ONLY);
+  cl_mem A_clmem = init_cl_buffer(cl, A, VECTOR_SIZE*VECTOR_SIZE, CL_MEM_READ_ONLY);
   cl_mem B_clmem = init_cl_buffer(cl, B, VECTOR_SIZE, CL_MEM_READ_ONLY);
   cl_mem C_clmem = init_cl_buffer(cl, NULL, VECTOR_SIZE, CL_MEM_WRITE_ONLY);
 
@@ -211,13 +207,14 @@ int main() {
 
   cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(cl->context, 1, (const char**)&cl_source, NULL, &err));
   CL_CHECK(clBuildProgram(program, 1, cl->devices, NULL, NULL, NULL));
-  cl_kernel kernel = CL_CHECK_ERR(clCreateKernel(program, "saxpy_kernel", &err));
+  cl_kernel kernel = CL_CHECK_ERR(clCreateKernel(program, "matmul", &err));
 
   // Set the kernel arguments
-  CL_CHECK(clSetKernelArg(kernel, 0, sizeof(float), &alpha));
+  int n_cols = VECTOR_SIZE;
+  CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &C_clmem));
   CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &A_clmem));
   CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &B_clmem));
-  CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &C_clmem));
+  CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int), &n_cols));
 
   // Execute the kernel
   size_t global_size = VECTOR_SIZE;
@@ -233,7 +230,7 @@ int main() {
 
   // Display the result
   for (int i = 0; i < VECTOR_SIZE; i++) {
-    printf("%f * %f + %f = %f\n", alpha, A[i], B[i], C[i]);
+    printf("%f, %f, %f\n", A[i], B[i], C[i]);
   }
 
   // Release all allocated objects and host buffers

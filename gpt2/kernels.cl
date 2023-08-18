@@ -1,9 +1,14 @@
-__kernel void saxpy_kernel(
-    float alpha,
+__kernel void matmul(
+    __global float* result,
     __global float* A,
-    __global float* B,
-    __global float* C)
+    __global float* X,
+    int n_cols)
 {
-    int index = get_global_id(0);
-    C[index] = alpha * A[index] + B[index];
+    int tx = get_global_id(0);
+
+    float value = 0;
+    for (unsigned int i = 0; i < n_cols; ++i) {
+        value += A[tx * n_cols + i] * X[i];
+    }
+    result[tx] = value;
 }
