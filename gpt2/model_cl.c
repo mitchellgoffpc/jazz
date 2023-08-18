@@ -170,18 +170,6 @@ void free_cl(CL* cl) {
 }
 
 
-const char *saxpy_kernel =
-"__kernel                                    \n"
-"void saxpy_kernel(float alpha,              \n"
-"                  __global float* A,        \n"
-"                  __global float* B,        \n"
-"                  __global float* C)        \n"
-"{                                           \n"
-"    int index = get_global_id(0);           \n"
-"    C[index] = alpha * A[index] + B[index]; \n"
-"}                                           \n";
-
-
 int main() {
   CL* cl = malloc(sizeof(CL));
   GPT2* model = malloc(sizeof(GPT2));
@@ -212,7 +200,16 @@ int main() {
   cl_mem C_clmem = init_cl_buffer(cl, NULL, VECTOR_SIZE, CL_MEM_WRITE_ONLY);
 
   // Create a program and kernel from the source
-  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(cl->context, 1,(const char **)&saxpy_kernel, NULL, &err));
+  f = fopen("gpt2/kernels.cl", "r");
+  if (!f) { fprintf(stderr, "Couldn't open file kernels.cl\n"); return 1; }
+  fseek(f, 0L, SEEK_END);
+  int sz = ftell(f);
+  char* cl_source = malloc(sz);
+  fseek(f, 0L, SEEK_SET);
+  fread(cl_source, 1, sz, f);
+  fclose(f);
+
+  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(cl->context, 1, (const char**)&cl_source, NULL, &err));
   CL_CHECK(clBuildProgram(program, 1, cl->devices, NULL, NULL, NULL));
   cl_kernel kernel = CL_CHECK_ERR(clCreateKernel(program, "saxpy_kernel", &err));
 
