@@ -18,6 +18,9 @@
   _ret;                              \
 })
 
+size_t global_size = VECTOR_SIZE;
+size_t local_size = 64;
+
 
 // Definitions
 
@@ -59,6 +62,8 @@ typedef struct {
 typedef struct {
   cl_mem past;
   cl_mem x;
+  cl_mem wte;
+  cl_mem wpe;
   cl_mem ln1;
   cl_mem qkv;
   cl_mem attn;
@@ -71,10 +76,17 @@ typedef struct {
 } State;
 
 typedef struct {
+  cl_kernel add;
+  cl_kernel embedding;
+  cl_kernel matmul;
+} Kernels;
+
+typedef struct {
   cl_platform_id* platforms;
   cl_device_id* devices;
   cl_context context;
   cl_command_queue command_queue;
+  Kernels kernels;
 } CL;
 
 
@@ -95,10 +107,31 @@ void init_cl(CL* cl) {
   cl->command_queue = CL_CHECK_ERR(clCreateCommandQueue(cl->context, cl->devices[0], 0, &err));
 }
 
+void init_cl_kernels(CL* cl, char* cl_source) {
+  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(cl->context, 1, (const char**)&cl_source, NULL, &err));
+  CL_CHECK(clBuildProgram(program, 1, cl->devices, NULL, NULL, NULL));
+  cl->kernels.add = CL_CHECK_ERR(clCreateKernel(program, "add", &err));
+  cl->kernels.embedding = CL_CHECK_ERR(clCreateKernel(program, "embedding", &err));
+  cl->kernels.matmul = CL_CHECK_ERR(clCreateKernel(program, "matmul", &err));
+  CL_CHECK(clReleaseProgram(program));
+}
+
 cl_mem init_cl_buffer(CL* cl, float* buf, size_t size, int mode) {
   cl_mem cl_buf = CL_CHECK_ERR(clCreateBuffer(cl->context, mode, size * sizeof(float), NULL, &err));
   if (buf) CL_CHECK(clEnqueueWriteBuffer(cl->command_queue, cl_buf, CL_TRUE, 0, size * sizeof(float), buf, 0, NULL, NULL));
   return cl_buf;
+}
+
+
+// CL Cleanup
+
+void free_cl(CL* cl) {
+  CL_CHECK(clReleaseKernel(cl->kernels.embedding));
+  CL_CHECK(clReleaseKernel(cl->kernels.matmul));
+  CL_CHECK(clReleaseCommandQueue(cl->command_queue));
+  CL_CHECK(clReleaseContext(cl->context));
+  free(cl->platforms);
+  free(cl->devices);
 }
 
 
@@ -148,6 +181,8 @@ void init_model(FILE* f, CL* cl, GPT2* model) {
 
 void init_state(CL* cl, State* state, Config cfg) {
   state->x = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->wte = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->wpe = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
   state->ln1 = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
   state->qkv = init_cl_buffer(cl, NULL, 3 * cfg.embed_size, CL_MEM_READ_WRITE);
   state->attn = init_cl_buffer(cl, NULL, cfg.context_size, CL_MEM_READ_WRITE);
@@ -160,21 +195,53 @@ void init_state(CL* cl, State* state, Config cfg) {
 }
 
 
-// Cleanup
+// Helper functions
 
-void free_cl(CL* cl) {
-  CL_CHECK(clReleaseCommandQueue(cl->command_queue));
-  CL_CHECK(clReleaseContext(cl->context));
-  free(cl->platforms);
-  free(cl->devices);
+cl_mem add(CL* cl, cl_mem result, cl_mem x, cl_mem y, size_t n) {
+  CL_CHECK(clSetKernelArg(cl->kernels.add, 0, sizeof(cl_mem), &result));
+  CL_CHECK(clSetKernelArg(cl->kernels.add, 1, sizeof(cl_mem), &x));
+  CL_CHECK(clSetKernelArg(cl->kernels.add, 2, sizeof(cl_mem), &y));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.add, 1, NULL, &n, &local_size, 0, NULL, NULL));
+  return result;
 }
 
+cl_mem embedding(CL* cl, cl_mem result, cl_mem data, size_t idx, size_t embed_size) {
+  CL_CHECK(clSetKernelArg(cl->kernels.embedding, 0, sizeof(cl_mem), &result));
+  CL_CHECK(clSetKernelArg(cl->kernels.embedding, 1, sizeof(cl_mem), &data));
+  CL_CHECK(clSetKernelArg(cl->kernels.embedding, 2, sizeof(int), &idx));
+  CL_CHECK(clSetKernelArg(cl->kernels.embedding, 3, sizeof(int), &embed_size));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.embedding, 1, NULL, &embed_size, &local_size, 0, NULL, NULL));
+  return result;
+}
+
+
+// Forward pass
+
+cl_mem gpt(CL* cl, GPT2* model, State* state, cl_mem past, int past_len, int token) {
+  Config cfg = model->config;
+  int cache_size = 2 * cfg.context_size * cfg.embed_size;
+  cl_mem x, wte, wpe;
+
+  wte = embedding(cl, state->wte, model->embed_tokens, token, cfg.embed_size);
+  wpe = embedding(cl, state->wpe, model->embed_pos, past_len, cfg.embed_size);
+  x = add(cl, state->x, wte, wpe, cfg.embed_size);
+  // for (int i = 0; i < cfg.num_layers; i++) {
+  //   x = add(state->x, x, attention(model, state, &past[i * cache_size], past_len, i, norm(state->ln1, &model->ln1, i, x)), cfg.embed_size);
+  //   x = add(state->x, x, mlp(model, state, i, norm(state->ln2, &model->ln2, i, x)), cfg.embed_size);
+  // }
+  // x = matmul(state->out, model->fc_out, norm(state->x, &model->ln_out, 0, x), cfg.embed_size, cfg.vocab_size);
+  return x;
+}
+
+
+// Main
 
 int main() {
   CL* cl = malloc(sizeof(CL));
   GPT2* model = malloc(sizeof(GPT2));
   State* state = malloc(sizeof(State));
 
+  // Load the model weights and initialize the model
   FILE* f = fopen("/tmp/weights.bin", "rb");
   if (!f) { fprintf(stderr, "Couldn't open file /tmp/weights.bin\n"); return 1; }
   init_cl(cl);
@@ -183,19 +250,7 @@ int main() {
   fclose(f);
   Config cfg = model->config;
 
-  // Create vectors A, B and C
-  float* A = malloc(VECTOR_SIZE * VECTOR_SIZE * sizeof(float));
-  float* B = malloc(VECTOR_SIZE * sizeof(float));
-  float* C = malloc(VECTOR_SIZE * sizeof(float));
-  for (int i = 0; i < VECTOR_SIZE*VECTOR_SIZE; i++) { A[i] = 1.0; }
-  for (int i = 0; i < VECTOR_SIZE; i++) { B[i] = 1.0/1024; }
-
-  // Create memory buffers on the device for each vector
-  cl_mem A_clmem = init_cl_buffer(cl, A, VECTOR_SIZE*VECTOR_SIZE, CL_MEM_READ_ONLY);
-  cl_mem B_clmem = init_cl_buffer(cl, B, VECTOR_SIZE, CL_MEM_READ_ONLY);
-  cl_mem C_clmem = init_cl_buffer(cl, NULL, VECTOR_SIZE, CL_MEM_WRITE_ONLY);
-
-  // Create a program and kernel from the source
+  // Load the kernel source and initialize the kernels
   f = fopen("gpt2/kernels.cl", "r");
   if (!f) { fprintf(stderr, "Couldn't open file kernels.cl\n"); return 1; }
   fseek(f, 0L, SEEK_END);
@@ -204,43 +259,19 @@ int main() {
   fseek(f, 0L, SEEK_SET);
   fread(cl_source, 1, sz, f);
   fclose(f);
+  init_cl_kernels(cl, cl_source);
 
-  cl_program program = CL_CHECK_ERR(clCreateProgramWithSource(cl->context, 1, (const char**)&cl_source, NULL, &err));
-  CL_CHECK(clBuildProgram(program, 1, cl->devices, NULL, NULL, NULL));
-  cl_kernel kernel = CL_CHECK_ERR(clCreateKernel(program, "matmul", &err));
+  // Forward pass
+  cl_mem past = init_cl_buffer(cl, NULL, 2 * cfg.num_layers * cfg.context_size * cfg.embed_size, CL_MEM_READ_WRITE);
+  cl_mem result = gpt(cl, model, state, past, 0, 0);
 
-  // Set the kernel arguments
-  int n_cols = VECTOR_SIZE;
-  CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &C_clmem));
-  CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &A_clmem));
-  CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &B_clmem));
-  CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int), &n_cols));
-
-  // Execute the kernel
-  size_t global_size = VECTOR_SIZE;
-  size_t local_size = 64;
-  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL));
-
-  // Copy result to the host
-  CL_CHECK(clEnqueueReadBuffer(cl->command_queue, C_clmem, CL_TRUE, 0, VECTOR_SIZE * sizeof(float), C, 0, NULL, NULL));
-
-  // Clean up and wait for all the comands to complete
+  float* result_host = malloc(cfg.embed_size * sizeof(float));
+  CL_CHECK(clEnqueueReadBuffer(cl->command_queue, result, CL_TRUE, 0, cfg.embed_size * sizeof(float), result_host, 0, NULL, NULL));
   CL_CHECK(clFlush(cl->command_queue));
   CL_CHECK(clFinish(cl->command_queue));
 
-  // Display the result
-  for (int i = 0; i < VECTOR_SIZE; i++) {
-    printf("%f, %f, %f\n", A[i], B[i], C[i]);
+  for (int i = 0; i < 3; i++) {
+    printf("%f ", result_host[i]);
   }
-
-  // Release all allocated objects and host buffers
-  CL_CHECK(clReleaseKernel(kernel));
-  CL_CHECK(clReleaseProgram(program));
-  CL_CHECK(clReleaseMemObject(A_clmem));
-  CL_CHECK(clReleaseMemObject(B_clmem));
-  CL_CHECK(clReleaseMemObject(C_clmem));
-  free_cl(cl);
-  free(A);
-  free(B);
-  free(C);
+  printf("\n");
 }
