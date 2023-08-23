@@ -204,14 +204,15 @@ float* norm(float* out, LayerNorm* norm, int layer, float* x) {
 
 float* attention(GPT2* model, State* state, float* past, int past_len, int layer, float* x) {
   Config cfg = model->config;
+  int cache_size = 2 * cfg.context_size * cfg.embed_size;  // size per layer
   int head_size = cfg.embed_size / cfg.num_heads;
   float* qkv, *attn, *q, *k, *v;
 
   qkv = linear(state->qkv, &model->qkv, layer, x);
   q = &qkv[0], k = &qkv[cfg.embed_size], v = &qkv[2 * cfg.embed_size];
   for (int i = 0; i < cfg.num_heads; i++) {
-    float* k_past = &past[i * cfg.context_size * head_size];
-    float* v_past = &past[(cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size)];
+    float* k_past = &past[layer * cache_size + i * cfg.context_size * head_size];
+    float* v_past = &past[layer * cache_size + (cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size)];
     memcpy(&k_past[past_len * head_size], &k[i * head_size], head_size * sizeof(float));
     memcpy(&v_past[past_len * head_size], &v[i * head_size], head_size * sizeof(float));
 
@@ -232,12 +233,11 @@ float* mlp(GPT2* model, State* state, int layer, float* x) {
 
 float* gpt(GPT2* model, State* state, float* past, int past_len, int token) {
   Config cfg = model->config;
-  int cache_size = 2 * cfg.context_size * cfg.embed_size;
   float* x;
 
   x = add(state->x, embedding(model->embed_tokens, token, cfg.embed_size), embedding(model->embed_pos, past_len, cfg.embed_size), cfg.embed_size);
   for (int i = 0; i < cfg.num_layers; i++) {
-    x = add(state->x, x, attention(model, state, &past[i * cache_size], past_len, i, norm(state->ln1, &model->ln1, i, x)), cfg.embed_size);
+    x = add(state->x, x, attention(model, state, past, past_len, i, norm(state->ln1, &model->ln1, i, x)), cfg.embed_size);
     x = add(state->x, x, mlp(model, state, i, norm(state->ln2, &model->ln2, i, x)), cfg.embed_size);
   }
   x = matmul(state->out, model->fc_out, norm(state->x, &model->ln_out, 0, x), cfg.embed_size, cfg.vocab_size);
