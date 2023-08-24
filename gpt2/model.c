@@ -211,8 +211,8 @@ float* attention(GPT2* model, State* state, float* past, int past_len, int layer
   qkv = linear(state->qkv, &model->qkv, layer, x);
   q = &qkv[0], k = &qkv[cfg.embed_size], v = &qkv[2 * cfg.embed_size];
   for (int i = 0; i < cfg.num_heads; i++) {
-    float* k_past = &past[layer * cache_size + i * cfg.context_size * head_size];
-    float* v_past = &past[layer * cache_size + (cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size)];
+    float* k_past = &past[(layer * cache_size) + (i * cfg.context_size * head_size)];
+    float* v_past = &past[(layer * cache_size) + (cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size)];
     memcpy(&k_past[past_len * head_size], &k[i * head_size], head_size * sizeof(float));
     memcpy(&v_past[past_len * head_size], &v[i * head_size], head_size * sizeof(float));
 

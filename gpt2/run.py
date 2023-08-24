@@ -104,6 +104,10 @@ if __name__ == '__main__':
   model.load_state_dict(state_dict)
   tokenizer = tiktoken.get_encoding("gpt2")
 
+  past = torch.zeros(1, config.num_layers, config.num_heads, 2, config.context_size, config.embed_size // config.num_heads)
+  model(torch.tensor([[0]]), past, 0)
+  exit()
+
   # Run sanity checks
   prompt = "The capital of Germany is Berlin. The capital of France is"
   context = torch.tensor(tokenizer.encode(prompt))[None].to(device)
