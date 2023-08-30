@@ -22,22 +22,25 @@ __kernel void gelu(__global float* x) {
   }));
 }
 
-__kernel void matmul(__global float* result, __global float* A, __global float* x, int A_offset, int x_offset, int n_cols) {
-  int tx = get_global_id(0);
+__kernel void matmul(__global float* result, __global float* A, __global float* x, int n_rows, int n_cols, int A_offset, int x_offset, int A_stride) {
+  int gid = get_global_id(0);
+  int row = gid % n_rows;
+  int aisle = gid / n_rows;
   float value = 0;
-  for (int i = 0; i < n_cols; i++) {
-    value += A[A_offset + tx * n_cols + i] * x[x_offset + i];
+  for (int col = 0; col < n_cols; col++) {
+    value += A[A_offset + (aisle * A_stride) + (row * n_cols) + col] * x[x_offset + (aisle * n_cols) + col];
   }
-  result[tx] = value;
+  result[aisle * n_rows + row] = value;
 }
-__kernel void matvmul(__global float* result, __global float* x, __global float* A, int x_offset, int A_offset, int result_offset, int n_rows) {
-  int tx = get_global_id(0);
-  int n_cols = get_global_size(0);
+__kernel void matvmul(__global float* result, __global float* x, __global float* A, int n_rows, int n_cols, int x_offset, int A_offset, int A_stride) {
+  int gid = get_global_id(0);
+  int col = gid % n_cols;
+  int aisle = gid / n_cols;
   float value = 0;
-  for (int i = 0; i < n_rows; i++) {
-    value += A[A_offset + tx + i * n_cols] * x[x_offset + i];
+  for (int row = 0; row < n_rows; row++) {
+    value += A[A_offset + (aisle * A_stride) + (row * n_cols) + col] * x[x_offset + (aisle * n_rows) + row];
   }
-  result[result_offset + tx] = value;
+  result[aisle * n_cols + col] = value;
 }
 
 __kernel void embedding(__global float* result, __global float* weights, int idx, int embed_size) {
@@ -45,21 +48,23 @@ __kernel void embedding(__global float* result, __global float* weights, int idx
     result[tx] = weights[idx * embed_size + tx];
 }
 
-__kernel void softmax(__global float* x) {
-  int tx = get_global_id(0);
-  int size = get_global_size(0);
+__kernel void softmax(__global float* x, int n_cols) {
+  int gid = get_global_id(0);
+  int row = gid / n_cols;
+  int offset = row * n_cols;
+
   float max = 0;
-  for (int i = 0; i < size; i++) {
-    max = x[i] > max ? x[i] : max;
+  for (int i = 0; i < n_cols; i++) {
+    max = x[offset+i] > max ? x[offset+i] : max;
   }
-  x[tx] = exp(x[tx] - max);
+  x[gid] = exp(x[gid] - max);
   barrier(CLK_GLOBAL_MEM_FENCE);
 
   float sum = 0;
-  for (int i = 0; i < size; i++) {
-    sum += x[i];
+  for (int i = 0; i < n_cols; i++) {
+    sum += x[offset+i];
   }
-  x[tx] = x[tx] / sum;
+  x[gid] = x[gid] / sum;
 }
 
 __kernel void norm(__global float* result, __global float* weight, __global float* bias, __global float* x, int offset) {
