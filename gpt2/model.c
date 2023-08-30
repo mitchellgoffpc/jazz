@@ -209,10 +209,13 @@ float* attention(GPT2* model, State* state, float* past, int past_len, int layer
   float* qkv, *attn, *q, *k, *v;
 
   qkv = linear(state->qkv, &model->qkv, layer, x);
-  q = &qkv[0], k = &qkv[cfg.embed_size], v = &qkv[2 * cfg.embed_size];
+  q = &qkv[0 * cfg.embed_size];
+  k = &qkv[1 * cfg.embed_size];
+  v = &qkv[2 * cfg.embed_size];
+
   for (int i = 0; i < cfg.num_heads; i++) {
-    float* k_past = &past[(layer * cache_size) + (i * cfg.context_size * head_size)];
-    float* v_past = &past[(layer * cache_size) + (cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size)];
+    float* k_past = &past[(layer * cache_size) + (0 * cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size)];
+    float* v_past = &past[(layer * cache_size) + (1 * cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size)];
     memcpy(&k_past[past_len * head_size], &k[i * head_size], head_size * sizeof(float));
     memcpy(&v_past[past_len * head_size], &v[i * head_size], head_size * sizeof(float));
 
@@ -221,6 +224,7 @@ float* attention(GPT2* model, State* state, float* past, int past_len, int layer
     attn = softmax(state->attn, past_len + 1);
     attn = matvmul(&state->attn_out[i * head_size], attn, v_past, past_len + 1, head_size);
   }
+
   x = linear(state->proj, &model->proj, layer, state->attn_out);
   return x;
 }

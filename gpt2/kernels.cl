@@ -1,31 +1,43 @@
-__kernel void copy(__global float* dst, __global float* src, int dst_offset, int src_offset) {
-  int tx = get_global_id(0);
-  dst[dst_offset + tx] = src[src_offset + tx];
+#define ELEMENTWISE(i, out, expr) ({ \
+  int i = get_global_id(0); \
+  out = (expr); \
+})
+
+__kernel void copy(__global float* dst, __global float* src, int dst_offset, int src_offset, int dst_stride, int src_stride) {
+  int col = get_local_id(0);
+  int row = get_global_id(0) / get_local_size(0);
+  dst[dst_offset + row*dst_stride + col] = src[src_offset + row*src_stride + col];
 }
 
-__kernel void add(__global float* result, __global float* x, __global float* y) {
-  int tx = get_global_id(0);
-  result[tx] = x[tx] + y[tx];
+__kernel void add(__global float* result, __global float* x, __global float* y, int x_offset, int y_offset) {
+  ELEMENTWISE(i, result[i], x[x_offset + i] + y[y_offset + i]);
 }
-
 __kernel void scale( __global float* x, float c) {
-  int tx = get_global_id(0);
-  x[tx] = x[tx] * c;
+  ELEMENTWISE(i, x[i], x[i] * c);
 }
-
 __kernel void gelu(__global float* x) {
-  int tx = get_global_id(0);
-  float y = x[tx];
-  x[tx] = 0.5 * y * (1 + tanh(sqrt(2 / M_PI) * (y + 0.044715 * y*y*y)));
+  ELEMENTWISE(i, x[i], ({
+    float y = x[i];
+    0.5 * y * (1 + tanh(sqrt(2 / M_PI) * (y + 0.044715 * y*y*y)));
+  }));
 }
 
 __kernel void matmul(__global float* result, __global float* A, __global float* x, int A_offset, int x_offset, int n_cols) {
   int tx = get_global_id(0);
   float value = 0;
   for (int i = 0; i < n_cols; i++) {
-    value += A[A_offset, tx * n_cols + i] * x[x_offset + i];
+    value += A[A_offset + tx * n_cols + i] * x[x_offset + i];
   }
   result[tx] = value;
+}
+__kernel void matvmul(__global float* result, __global float* x, __global float* A, int x_offset, int A_offset, int result_offset, int n_rows) {
+  int tx = get_global_id(0);
+  int n_cols = get_global_size(0);
+  float value = 0;
+  for (int i = 0; i < n_rows; i++) {
+    value += A[A_offset + tx + i * n_cols] * x[x_offset + i];
+  }
+  result[result_offset + tx] = value;
 }
 
 __kernel void embedding(__global float* result, __global float* weights, int idx, int embed_size) {
@@ -33,8 +45,26 @@ __kernel void embedding(__global float* result, __global float* weights, int idx
     result[tx] = weights[idx * embed_size + tx];
 }
 
-__kernel void norm(__global float* result, __global float* weight, __global float* bias, __global float* x, int size, int layer) {
+__kernel void softmax(__global float* x) {
   int tx = get_global_id(0);
+  int size = get_global_size(0);
+  float max = 0;
+  for (int i = 0; i < size; i++) {
+    max = x[i] > max ? x[i] : max;
+  }
+  x[tx] = exp(x[tx] - max);
+  barrier(CLK_GLOBAL_MEM_FENCE);
+
+  float sum = 0;
+  for (int i = 0; i < size; i++) {
+    sum += x[i];
+  }
+  x[tx] = x[tx] / sum;
+}
+
+__kernel void norm(__global float* result, __global float* weight, __global float* bias, __global float* x, int offset) {
+  int tx = get_global_id(0);
+  int size = get_global_size(0);
   float mean = 0, var = 0;
   for (int i = 0; i < size; i++) {
     mean += x[i] / size;
@@ -44,5 +74,5 @@ __kernel void norm(__global float* result, __global float* weight, __global floa
   }
   float std = sqrt(var) + 1e-5; // epsilon
   float y = (x[tx] - mean) / std;
-  result[tx] = y * weight[layer * size + tx] + bias[layer * size + tx];
+  result[tx] = y * weight[offset + tx] + bias[offset + tx];
 }

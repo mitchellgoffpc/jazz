@@ -1,4 +1,5 @@
 #include <math.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -87,8 +88,10 @@ typedef struct {
   cl_kernel add;
   cl_kernel scale;
   cl_kernel gelu;
-  cl_kernel embedding;
   cl_kernel matmul;
+  cl_kernel matvmul;
+  cl_kernel embedding;
+  cl_kernel softmax;
   cl_kernel norm;
 } Kernels;
 
@@ -125,8 +128,10 @@ void init_cl_kernels(CL* cl, char* cl_source) {
   cl->kernels.add = CL_CHECK_ERR(clCreateKernel(program, "add", &err));
   cl->kernels.scale = CL_CHECK_ERR(clCreateKernel(program, "scale", &err));
   cl->kernels.gelu = CL_CHECK_ERR(clCreateKernel(program, "gelu", &err));
-  cl->kernels.embedding = CL_CHECK_ERR(clCreateKernel(program, "embedding", &err));
   cl->kernels.matmul = CL_CHECK_ERR(clCreateKernel(program, "matmul", &err));
+  cl->kernels.matvmul = CL_CHECK_ERR(clCreateKernel(program, "matvmul", &err));
+  cl->kernels.embedding = CL_CHECK_ERR(clCreateKernel(program, "embedding", &err));
+  cl->kernels.softmax = CL_CHECK_ERR(clCreateKernel(program, "softmax", &err));
   cl->kernels.norm = CL_CHECK_ERR(clCreateKernel(program, "norm", &err));
   CL_CHECK(clReleaseProgram(program));
 }
@@ -212,28 +217,44 @@ void init_state(CL* cl, State* state, Config cfg) {
 
 // Helper functions
 
-cl_mem copy(CL* cl, cl_mem dst, cl_mem src, size_t dst_offset, size_t src_offset, size_t n) {
+typedef struct {
+  size_t global_size;
+  size_t local_size;
+} Workgroup;
+
+Workgroup get_workgroup(size_t size) {
+  size_t capped_local_size = local_size < size ? local_size : size;
+  size_t global_size = (size + capped_local_size - 1) / capped_local_size * capped_local_size;
+  return (Workgroup){ .global_size = global_size, .local_size = capped_local_size };
+}
+
+cl_mem copy(CL* cl, cl_mem dst, cl_mem src, size_t dst_offset, size_t src_offset, size_t n_rows, size_t n_cols, size_t src_stride, size_t dst_stride) {
+  size_t global_size = n_rows * n_cols;
   CL_CHECK(clSetKernelArg(cl->kernels.copy, 0, sizeof(cl_mem), &dst));
   CL_CHECK(clSetKernelArg(cl->kernels.copy, 1, sizeof(cl_mem), &src));
   CL_CHECK(clSetKernelArg(cl->kernels.copy, 2, sizeof(int), &dst_offset));
   CL_CHECK(clSetKernelArg(cl->kernels.copy, 3, sizeof(int), &src_offset));
-  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.copy, 1, NULL, &n, &local_size, 0, NULL, NULL));
+  CL_CHECK(clSetKernelArg(cl->kernels.copy, 4, sizeof(int), &src_stride));
+  CL_CHECK(clSetKernelArg(cl->kernels.copy, 5, sizeof(int), &dst_stride));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.copy, 1, NULL, &global_size, &n_cols, 0, NULL, NULL));
   return dst;
 }
 
-cl_mem add(CL* cl, cl_mem result, cl_mem x, cl_mem y, size_t n) {
+cl_mem add(CL* cl, cl_mem result, cl_mem x, cl_mem y, size_t n, size_t x_offset, size_t y_offset) {
   CL_CHECK(clSetKernelArg(cl->kernels.add, 0, sizeof(cl_mem), &result));
   CL_CHECK(clSetKernelArg(cl->kernels.add, 1, sizeof(cl_mem), &x));
   CL_CHECK(clSetKernelArg(cl->kernels.add, 2, sizeof(cl_mem), &y));
+  CL_CHECK(clSetKernelArg(cl->kernels.add, 3, sizeof(int), &x_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.add, 4, sizeof(int), &y_offset));
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.add, 1, NULL, &n, &local_size, 0, NULL, NULL));
   return result;
 }
 
 cl_mem scale(CL* cl, cl_mem x, float c, size_t n) {
-  size_t capped_local_size = local_size < n ? local_size : n;
+  Workgroup wg = get_workgroup(n);
   CL_CHECK(clSetKernelArg(cl->kernels.scale, 0, sizeof(cl_mem), &x));
   CL_CHECK(clSetKernelArg(cl->kernels.scale, 1, sizeof(float), &c));
-  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.scale, 1, NULL, &n, &capped_local_size, 0, NULL, NULL));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.scale, 1, NULL, &wg.global_size, &wg.local_size, 0, NULL, NULL));
   return x;
 }
 
@@ -244,13 +265,26 @@ cl_mem gelu(CL* cl, cl_mem x, size_t n) {
 }
 
 cl_mem matmul(CL* cl, cl_mem result, cl_mem A, cl_mem x, size_t n_cols, size_t n_rows, size_t A_offset, size_t x_offset) {
+  Workgroup wg = get_workgroup(n_rows);
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 0, sizeof(cl_mem), &result));
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 1, sizeof(cl_mem), &A));
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 2, sizeof(cl_mem), &x));
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 3, sizeof(int), &A_offset));
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 4, sizeof(int), &x_offset));
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 5, sizeof(int), &n_cols));
-  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.matmul, 1, NULL, &n_rows, &local_size, 0, NULL, NULL));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.matmul, 1, NULL, &wg.global_size, &wg.local_size, 0, NULL, NULL));
+  return result;
+}
+
+cl_mem matvmul(CL* cl, cl_mem result, cl_mem x, cl_mem A, size_t n_cols, size_t n_rows, size_t x_offset, size_t A_offset, size_t result_offset) {
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 0, sizeof(cl_mem), &result));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 1, sizeof(cl_mem), &x));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 2, sizeof(cl_mem), &A));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 3, sizeof(int), &x_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 4, sizeof(int), &A_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 5, sizeof(int), &result_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 6, sizeof(int), &n_rows));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.matvmul, 1, NULL, &n_cols, &local_size, 0, NULL, NULL));
   return result;
 }
 
@@ -263,21 +297,27 @@ cl_mem embedding(CL* cl, cl_mem result, cl_mem data, size_t idx, size_t embed_si
   return result;
 }
 
+cl_mem softmax(CL* cl, cl_mem x, size_t n) {
+  Workgroup wg = get_workgroup(n);
+  CL_CHECK(clSetKernelArg(cl->kernels.softmax, 0, sizeof(cl_mem), &x));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.softmax, 1, NULL, &wg.global_size, &wg.local_size, 0, NULL, NULL));
+  return x;
+}
+
 cl_mem norm(CL* cl, cl_mem result, LayerNorm* norm, int layer, cl_mem x) {
-  size_t global_size = 1;
+  size_t offset = layer * norm->size;
   CL_CHECK(clSetKernelArg(cl->kernels.norm, 0, sizeof(cl_mem), &result));
   CL_CHECK(clSetKernelArg(cl->kernels.norm, 1, sizeof(cl_mem), &norm->weight));
   CL_CHECK(clSetKernelArg(cl->kernels.norm, 2, sizeof(cl_mem), &norm->bias));
   CL_CHECK(clSetKernelArg(cl->kernels.norm, 3, sizeof(cl_mem), &x));
-  CL_CHECK(clSetKernelArg(cl->kernels.norm, 4, sizeof(int), &norm->size));
-  CL_CHECK(clSetKernelArg(cl->kernels.norm, 5, sizeof(int), &layer));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm, 4, sizeof(int), &offset));
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.norm, 1, NULL, &norm->size, &local_size, 0, NULL, NULL));
   return result;
 }
 
 cl_mem linear(CL* cl, cl_mem result, Linear* fc, int layer, cl_mem x) {
   x = matmul(cl, result, fc->weight, x, fc->in_size, fc->out_size, layer*fc->in_size*fc->out_size, 0);
-  x = add(cl, result, fc->bias, x, fc->out_size);
+  x = add(cl, result, fc->bias, x, fc->out_size, layer*fc->out_size, 0);
   return x;
 }
 
@@ -291,19 +331,25 @@ cl_mem attention(CL* cl, GPT2* model, State* state, cl_mem past, int past_len, i
   cl_mem qkv, attn;
 
   qkv = linear(cl, state->qkv, &model->qkv, layer, x);
-  for (int i = 0; i < cfg.num_heads; i++) {
-    size_t k_past_offset = (layer * cache_size) + (i * cfg.context_size * head_size);
-    size_t v_past_offset = (layer * cache_size) + (cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size);
-    copy(cl, past, qkv, k_past_offset + (past_len * head_size), (1 * cfg.embed_size) + (i * head_size), head_size);
-    copy(cl, past, qkv, v_past_offset + (past_len * head_size), (2 * cfg.embed_size) + (i * head_size), head_size);
+  size_t k_past_offset = (layer * cache_size) + (0 * cfg.num_heads * cfg.context_size * head_size);  // past is B, H, T, C // H
+  size_t v_past_offset = (layer * cache_size) + (1 * cfg.num_heads * cfg.context_size * head_size);
+  copy(cl, past, qkv, k_past_offset + (past_len * head_size), (1 * cfg.embed_size), cfg.num_heads, head_size, cfg.context_size * head_size, head_size);
+  copy(cl, past, qkv, v_past_offset + (past_len * head_size), (2 * cfg.embed_size), cfg.num_heads, head_size, cfg.context_size * head_size, head_size);
 
-    attn = matmul(cl, state->attn, past, qkv, past_len + 1, head_size, k_past_offset + i * head_size, i * head_size);
-    attn = scale(cl, state->attn, (1.0 / sqrt(head_size)), past_len + 1);
-    // attn = softmax(state->attn, past_len + 1);
-    // attn = matvmul(&state->attn_out[i * head_size], attn, v_past, past_len + 1, head_size);
+  for (int i = 0; i < cfg.num_heads; i++) {
+    // size_t k_past_offset = (layer * cache_size) + (0 * cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size);
+    // size_t v_past_offset = (layer * cache_size) + (1 * cfg.num_heads * cfg.context_size * head_size) + (i * cfg.context_size * head_size);
+    // copy(cl, past, qkv, k_past_offset + (past_len * head_size), (1 * cfg.embed_size) + (i * head_size), head_size);
+    // copy(cl, past, qkv, v_past_offset + (past_len * head_size), (2 * cfg.embed_size) + (i * head_size), head_size);
+
+    // attn = matmul(cl, state->attn, past, qkv, past_len + 1, head_size, k_past_offset + i * head_size, i * head_size);
+    // attn = scale(cl, state->attn, (1.0 / sqrt(head_size)), past_len + 1);
+    // attn = softmax(cl, state->attn, past_len + 1);
+    // attn = matvmul(cl, state->attn_out, attn, past, head_size, past_len + 1, 0, v_past_offset + i * head_size, i * head_size);
   }
-  // x = linear(state->proj, &model->proj, layer, state->attn_out);
-  return qkv;
+  copy(cl, state->attn_out, past, 0, v_past_offset + (past_len * head_size), cfg.num_heads, head_size, head_size, cfg.context_size * head_size);
+  x = linear(cl, state->proj, &model->proj, layer, state->attn_out);
+  return x;
 }
 
 cl_mem mlp(CL* cl, GPT2* model, State* state, int layer, cl_mem x) {
@@ -319,19 +365,25 @@ cl_mem gpt(CL* cl, GPT2* model, State* state, cl_mem past, int past_len, int tok
 
   wte = embedding(cl, state->wte, model->embed_tokens, token, cfg.embed_size);
   wpe = embedding(cl, state->wpe, model->embed_pos, past_len, cfg.embed_size);
-  x = add(cl, state->x, wte, wpe, cfg.embed_size);
+  x = add(cl, state->x, wte, wpe, cfg.embed_size, 0, 0);
   for (int i = 0; i < cfg.num_layers; i++) {
-    x = attention(cl, model, state, past, past_len, i, norm(cl, state->ln1, &model->ln1, i, x));
-    // x = add(cl, state->x, x, , cfg.embed_size);
-    // x = add(cl, state->x, x, mlp(cl, model, state, i, norm(cl, state->ln2, &model->ln2, i, x)), cfg.embed_size);
-    break;
+    x = add(cl, state->x, x, attention(cl, model, state, past, past_len, i, norm(cl, state->ln1, &model->ln1, i, x)), cfg.embed_size, 0, 0);
+    x = add(cl, state->x, x, mlp(cl, model, state, i, norm(cl, state->ln2, &model->ln2, i, x)), cfg.embed_size, 0, 0);
   }
-  // x = matmul(state->out, model->fc_out, norm(state->x, &model->ln_out, 0, x), cfg.embed_size, cfg.vocab_size);
+  x = matmul(cl, state->out, model->fc_out, norm(cl, state->x, &model->ln_out, 0, x), cfg.embed_size, cfg.vocab_size, 0, 0);
   return x;
 }
 
 
 // Main
+
+#define NUM_SAMPLES 100
+#define BENCHMARK(n, expr) ({ \
+  clock_t start_time = clock(); \
+  for (int i = 0; i < (n); i++) { expr; } \
+  double elapsed_time = (double)(clock() - start_time) / CLOCKS_PER_SEC; \
+  printf("DONE, %f.2 it/s\n", n / elapsed_time); \
+})
 
 int main() {
   CL* cl = malloc(sizeof(CL));
@@ -372,4 +424,11 @@ int main() {
     printf("%f ", result_host[i]);
   }
   printf("\n");
+
+  // BENCHMARK(NUM_SAMPLES, ({
+  //   cl_mem result = gpt(cl, model, state, past, 0, 0);
+  //   CL_CHECK(clEnqueueReadBuffer(cl->command_queue, result, CL_TRUE, 0, cfg.embed_size * sizeof(float), result_host, 0, NULL, NULL));
+  //   CL_CHECK(clFlush(cl->command_queue));
+  //   CL_CHECK(clFinish(cl->command_queue));
+  // }));
 }
