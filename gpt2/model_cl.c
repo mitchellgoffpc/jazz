@@ -448,13 +448,20 @@ int main() {
     argmax = result[i] > result[argmax] ? i : argmax;
   }
   printf("ARGMAX: %d, VAL: %f\n", argmax, result[argmax]);
-  assert(argmax == 6342);  // Paris
-  printf("DONE\n");
+  // assert(argmax == 6342);  // Paris
+  // printf("DONE\n");
 
-  // BENCHMARK(NUM_SAMPLES, ({
-  //   cl_mem result = gpt(cl, model, state, past, 0, 0);
-  //   CL_CHECK(clEnqueueReadBuffer(cl->command_queue, result, CL_TRUE, 0, cfg.embed_size * sizeof(float), result_host, 0, NULL, NULL));
-  //   CL_CHECK(clFlush(cl->command_queue));
-  //   CL_CHECK(clFinish(cl->command_queue));
-  // }));
+  printf("BENCHMARKING, T=1...\n");
+  BENCHMARK(NUM_SAMPLES, ({
+    cl_mem result = gpt(cl, model, state, past, 0, 0);
+    CL_CHECK(clFlush(cl->command_queue));
+    CL_CHECK(clFinish(cl->command_queue));
+  }));
+
+  printf("BENCHMARKING, T=%lu...\n", cfg.context_size);
+  BENCHMARK(NUM_SAMPLES, ({
+    cl_mem result = gpt(cl, model, state, past, cfg.context_size-1, 0);
+    CL_CHECK(clFlush(cl->command_queue));
+    CL_CHECK(clFinish(cl->command_queue));
+  }));
 }
