@@ -3,14 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <sys/time.h>
 
 #ifdef __APPLE__
 #include <OpenCL/cl.h>
 #else
 #include <CL/cl.h>
 #endif
-
-#define VECTOR_SIZE 1024
 
 // #define CL_CHECK(_expr) assert((_expr) == CL_SUCCESS);
 #define CL_CHECK(_expr) ({ \
@@ -26,7 +25,6 @@
   _ret;                              \
 })
 
-size_t global_size = VECTOR_SIZE;
 size_t local_size = 64;
 
 
@@ -246,6 +244,7 @@ cl_mem add(CL* cl, cl_mem result, cl_mem x, cl_mem y, size_t n, size_t x_offset,
   CL_CHECK(clSetKernelArg(cl->kernels.add, 2, sizeof(cl_mem), &y));
   CL_CHECK(clSetKernelArg(cl->kernels.add, 3, sizeof(int), &x_offset));
   CL_CHECK(clSetKernelArg(cl->kernels.add, 4, sizeof(int), &y_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.add, 5, sizeof(int), &n));
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.add, 1, NULL, &n, &local_size, 0, NULL, NULL));
   return result;
 }
@@ -254,12 +253,14 @@ cl_mem scale(CL* cl, cl_mem x, float c, size_t n) {
   Workgroup wg = get_workgroup(n);
   CL_CHECK(clSetKernelArg(cl->kernels.scale, 0, sizeof(cl_mem), &x));
   CL_CHECK(clSetKernelArg(cl->kernels.scale, 1, sizeof(float), &c));
+  CL_CHECK(clSetKernelArg(cl->kernels.scale, 2, sizeof(float), &n));
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.scale, 1, NULL, &wg.global_size, &wg.local_size, 0, NULL, NULL));
   return x;
 }
 
 cl_mem gelu(CL* cl, cl_mem x, size_t n) {
   CL_CHECK(clSetKernelArg(cl->kernels.gelu, 0, sizeof(cl_mem), &x));
+  CL_CHECK(clSetKernelArg(cl->kernels.gelu, 1, sizeof(int), &n));
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.gelu, 1, NULL, &n, &local_size, 0, NULL, NULL));
   return x;
 }
@@ -269,11 +270,12 @@ cl_mem matmul(CL* cl, cl_mem result, cl_mem A, cl_mem x, size_t n_aisles, size_t
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 0, sizeof(cl_mem), &result));
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 1, sizeof(cl_mem), &A));
   CL_CHECK(clSetKernelArg(cl->kernels.matmul, 2, sizeof(cl_mem), &x));
-  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 3, sizeof(int), &n_rows));
-  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 4, sizeof(int), &n_cols));
-  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 5, sizeof(int), &A_offset));
-  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 6, sizeof(int), &x_offset));
-  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 7, sizeof(int), &A_stride));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 3, sizeof(int), &n_aisles));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 4, sizeof(int), &n_rows));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 5, sizeof(int), &n_cols));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 6, sizeof(int), &A_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 7, sizeof(int), &x_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul, 8, sizeof(int), &A_stride));
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.matmul, 1, NULL, &wg.global_size, &wg.local_size, 0, NULL, NULL));
   return result;
 }
@@ -283,11 +285,12 @@ cl_mem matvmul(CL* cl, cl_mem result, cl_mem x, cl_mem A, size_t n_aisles, size_
   CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 0, sizeof(cl_mem), &result));
   CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 1, sizeof(cl_mem), &x));
   CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 2, sizeof(cl_mem), &A));
-  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 3, sizeof(int), &n_rows));
-  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 4, sizeof(int), &n_cols));
-  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 5, sizeof(int), &x_offset));
-  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 6, sizeof(int), &A_offset));
-  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 7, sizeof(int), &A_stride));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 3, sizeof(int), &n_aisles));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 4, sizeof(int), &n_rows));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 5, sizeof(int), &n_cols));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 6, sizeof(int), &x_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 7, sizeof(int), &A_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 8, sizeof(int), &A_stride));
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.matvmul, 1, NULL, &wg.global_size, &wg.local_size, 0, NULL, NULL));
   return result;
 }
@@ -301,10 +304,11 @@ cl_mem embedding(CL* cl, cl_mem result, cl_mem data, size_t idx, size_t embed_si
   return result;
 }
 
-cl_mem softmax(CL* cl, cl_mem x, size_t num_rows, size_t n_cols) {
-  Workgroup wg = get_workgroup(num_rows * n_cols);
+cl_mem softmax(CL* cl, cl_mem x, size_t n_rows, size_t n_cols) {
+  Workgroup wg = get_workgroup(n_rows * n_cols);
   CL_CHECK(clSetKernelArg(cl->kernels.softmax, 0, sizeof(cl_mem), &x));
-  CL_CHECK(clSetKernelArg(cl->kernels.softmax, 1, sizeof(int), &n_cols));
+  CL_CHECK(clSetKernelArg(cl->kernels.softmax, 1, sizeof(int), &n_rows));
+  CL_CHECK(clSetKernelArg(cl->kernels.softmax, 2, sizeof(int), &n_cols));
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.softmax, 1, NULL, &wg.global_size, &wg.local_size, 0, NULL, NULL));
   return x;
 }
@@ -346,17 +350,6 @@ cl_mem attention(CL* cl, GPT2* model, State* state, cl_mem past, int past_len, i
   attn = softmax(cl, state->attn, cfg.num_heads, past_len + 1);
   attn = matvmul(cl, state->attn_out, attn, past, cfg.num_heads, past_len + 1, head_size, 0, v_past_offset, cfg.context_size * head_size);
 
-  // // DEBUG
-  // float* result_host = malloc(cfg.embed_size * sizeof(float));
-  // CL_CHECK(clEnqueueReadBuffer(cl->command_queue, attn, CL_TRUE, 0, cfg.embed_size * sizeof(float), result_host, 0, NULL, NULL));
-  // CL_CHECK(clFlush(cl->command_queue));
-  // CL_CHECK(clFinish(cl->command_queue));
-  // for (int i = 0; i < 3; i++) {
-  //   printf("%f ", result_host[i]);
-  // }
-  // printf("\n");
-  // exit(0);
-
   x = linear(cl, state->proj, &model->proj, layer, attn);
   return x;
 }
@@ -388,9 +381,13 @@ cl_mem gpt(CL* cl, GPT2* model, State* state, cl_mem past, int past_len, int tok
 
 #define NUM_SAMPLES 100
 #define BENCHMARK(n, expr) ({ \
-  clock_t start_time = clock(); \
+  struct timeval tv; \
+  gettimeofday(&tv, NULL); \
+  unsigned long start_time = 1000000 * tv.tv_sec + tv.tv_usec; \
   for (int i = 0; i < (n); i++) { expr; } \
-  double elapsed_time = (double)(clock() - start_time) / CLOCKS_PER_SEC; \
+  gettimeofday(&tv, NULL); \
+  unsigned long end_time = 1000000 * tv.tv_sec + tv.tv_usec; \
+  double elapsed_time = (double)(end_time - start_time) / 1000000; \
   printf("DONE, %f.2 it/s\n", n / elapsed_time); \
 })
 
@@ -447,21 +444,21 @@ int main() {
   for (int i = 0; i < cfg.vocab_size; i++) {
     argmax = result[i] > result[argmax] ? i : argmax;
   }
-  printf("ARGMAX: %d, VAL: %f\n", argmax, result[argmax]);
-  // assert(argmax == 6342);  // Paris
-  // printf("DONE\n");
+  assert(argmax == 6342);  // Paris
+  printf("DONE\n");
 
   printf("BENCHMARKING, T=1...\n");
   BENCHMARK(NUM_SAMPLES, ({
-    cl_mem result = gpt(cl, model, state, past, 0, 0);
+    cl_mem cl_result = gpt(cl, model, state, past, 0, 0);
+    CL_CHECK(clEnqueueReadBuffer(cl->command_queue, state->out, CL_TRUE, 0, cfg.vocab_size * sizeof(float), result, 0, NULL, NULL));
     CL_CHECK(clFlush(cl->command_queue));
     CL_CHECK(clFinish(cl->command_queue));
   }));
 
-  printf("BENCHMARKING, T=%lu...\n", cfg.context_size);
-  BENCHMARK(NUM_SAMPLES, ({
-    cl_mem result = gpt(cl, model, state, past, cfg.context_size-1, 0);
-    CL_CHECK(clFlush(cl->command_queue));
-    CL_CHECK(clFinish(cl->command_queue));
-  }));
+  // printf("BENCHMARKING, T=%lu...\n", cfg.context_size);
+  // BENCHMARK(NUM_SAMPLES, ({
+  //   cl_mem result = gpt(cl, model, state, past, cfg.context_size-1, 0);
+  //   CL_CHECK(clFlush(cl->command_queue));
+  //   CL_CHECK(clFinish(cl->command_queue));
+  // }));
 }
