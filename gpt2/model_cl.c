@@ -1,5 +1,4 @@
 #include <math.h>
-#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -70,12 +69,12 @@ typedef struct {
   cl_mem x;
   cl_mem wte;
   cl_mem wpe;
-  cl_mem ln1;
+  cl_mem ln_part;
+  cl_mem ln_out;
   cl_mem qkv;
   cl_mem attn;
   cl_mem attn_out;
   cl_mem proj;
-  cl_mem ln2;
   cl_mem fc1;
   cl_mem fc2;
   cl_mem out;
@@ -91,6 +90,9 @@ typedef struct {
   cl_kernel embedding;
   cl_kernel softmax;
   cl_kernel norm;
+  cl_kernel norm_a;
+  cl_kernel norm_b;
+  cl_kernel norm_c;
 } Kernels;
 
 typedef struct {
@@ -131,6 +133,9 @@ void init_cl_kernels(CL* cl, char* cl_source) {
   cl->kernels.embedding = CL_CHECK_ERR(clCreateKernel(program, "embedding", &err));
   cl->kernels.softmax = CL_CHECK_ERR(clCreateKernel(program, "softmax", &err));
   cl->kernels.norm = CL_CHECK_ERR(clCreateKernel(program, "norm", &err));
+  cl->kernels.norm_a = CL_CHECK_ERR(clCreateKernel(program, "norm_a", &err));
+  cl->kernels.norm_b = CL_CHECK_ERR(clCreateKernel(program, "norm_b", &err));
+  cl->kernels.norm_c = CL_CHECK_ERR(clCreateKernel(program, "norm_c", &err));
   CL_CHECK(clReleaseProgram(program));
 }
 
@@ -201,12 +206,12 @@ void init_state(CL* cl, State* state, Config cfg) {
   state->x = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
   state->wte = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
   state->wpe = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
-  state->ln1 = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->ln_part = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
+  state->ln_out = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
   state->qkv = init_cl_buffer(cl, NULL, 3 * cfg.embed_size, CL_MEM_READ_WRITE);
   state->attn = init_cl_buffer(cl, NULL, cfg.context_size, CL_MEM_READ_WRITE);
   state->attn_out = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
   state->proj = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
-  state->ln2 = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
   state->fc1 = init_cl_buffer(cl, NULL, 4 * cfg.embed_size, CL_MEM_READ_WRITE);
   state->fc2 = init_cl_buffer(cl, NULL, cfg.embed_size, CL_MEM_READ_WRITE);
   state->out = init_cl_buffer(cl, NULL, cfg.vocab_size, CL_MEM_READ_WRITE);
@@ -313,15 +318,40 @@ cl_mem softmax(CL* cl, cl_mem x, size_t n_rows, size_t n_cols) {
   return x;
 }
 
-cl_mem norm(CL* cl, cl_mem result, LayerNorm* norm, int layer, cl_mem x) {
+// cl_mem norm(CL* cl, State* state, LayerNorm* norm, int layer, cl_mem x) {
+//   cl_mem result = state->ln_out;
+//   size_t offset = layer * norm->size;
+//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 0, sizeof(cl_mem), &result));
+//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 1, sizeof(cl_mem), &norm->weight));
+//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 2, sizeof(cl_mem), &norm->bias));
+//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 3, sizeof(cl_mem), &x));
+//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 4, sizeof(float) * local_size, NULL));
+//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 5, sizeof(int), &offset));
+//   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.norm, 1, NULL, &norm->size, &local_size, 0, NULL, NULL));
+//   return result;
+// }
+
+cl_mem norm(CL* cl, State* state, LayerNorm* norm, int layer, cl_mem x) {
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_a, 0, sizeof(cl_mem), &state->ln_part));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_a, 1, sizeof(cl_mem), &x));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_a, 2, sizeof(float) * local_size, NULL));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.norm_a, 1, NULL, &norm->size, &local_size, 0, NULL, NULL));
+
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_b, 0, sizeof(cl_mem), &state->ln_part));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_b, 1, sizeof(cl_mem), &x));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_b, 2, sizeof(float) * local_size, NULL));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.norm_b, 1, NULL, &norm->size, &local_size, 0, NULL, NULL));
+
   size_t offset = layer * norm->size;
-  CL_CHECK(clSetKernelArg(cl->kernels.norm, 0, sizeof(cl_mem), &result));
-  CL_CHECK(clSetKernelArg(cl->kernels.norm, 1, sizeof(cl_mem), &norm->weight));
-  CL_CHECK(clSetKernelArg(cl->kernels.norm, 2, sizeof(cl_mem), &norm->bias));
-  CL_CHECK(clSetKernelArg(cl->kernels.norm, 3, sizeof(cl_mem), &x));
-  CL_CHECK(clSetKernelArg(cl->kernels.norm, 4, sizeof(int), &offset));
-  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.norm, 1, NULL, &norm->size, &local_size, 0, NULL, NULL));
-  return result;
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_c, 0, sizeof(cl_mem), &state->ln_out));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_c, 1, sizeof(cl_mem), &state->ln_part));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_c, 2, sizeof(cl_mem), &norm->weight));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_c, 3, sizeof(cl_mem), &norm->bias));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_c, 4, sizeof(cl_mem), &x));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_c, 5, sizeof(float) * local_size, NULL));
+  CL_CHECK(clSetKernelArg(cl->kernels.norm_c, 6, sizeof(int), &offset));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.norm_c, 1, NULL, &norm->size, &local_size, 0, NULL, NULL));
+  return state->ln_out;
 }
 
 cl_mem linear(CL* cl, cl_mem result, Linear* fc, int layer, cl_mem x) {
@@ -369,17 +399,17 @@ cl_mem gpt(CL* cl, GPT2* model, State* state, cl_mem past, int past_len, int tok
   wpe = embedding(cl, state->wpe, model->embed_pos, past_len, cfg.embed_size);
   x = add(cl, state->x, wte, wpe, cfg.embed_size, 0, 0);
   for (int i = 0; i < cfg.num_layers; i++) {
-    x = add(cl, state->x, x, attention(cl, model, state, past, past_len, i, norm(cl, state->ln1, &model->ln1, i, x)), cfg.embed_size, 0, 0);
-    x = add(cl, state->x, x, mlp(cl, model, state, i, norm(cl, state->ln2, &model->ln2, i, x)), cfg.embed_size, 0, 0);
+    x = add(cl, state->x, x, attention(cl, model, state, past, past_len, i, norm(cl, state, &model->ln1, i, x)), cfg.embed_size, 0, 0);
+    x = add(cl, state->x, x, mlp(cl, model, state, i, norm(cl, state, &model->ln2, i, x)), cfg.embed_size, 0, 0);
   }
-  x = matmul(cl, state->out, model->fc_out, norm(cl, state->x, &model->ln_out, 0, x), 1, cfg.vocab_size, cfg.embed_size, 0, 0, 0);
+  x = matmul(cl, state->out, model->fc_out, norm(cl, state, &model->ln_out, 0, x), 1, cfg.vocab_size, cfg.embed_size, 0, 0, 0);
   return x;
 }
 
 
 // Main
 
-#define NUM_SAMPLES 100
+#define NUM_SAMPLES 1000
 #define BENCHMARK(n, expr) ({ \
   struct timeval tv; \
   gettimeofday(&tv, NULL); \
@@ -421,18 +451,24 @@ int main() {
   printf("TESTING...\n");
   cl_mem past = init_cl_buffer(cl, NULL, 2 * cfg.num_layers * cfg.context_size * cfg.embed_size, CL_MEM_READ_WRITE);
   int tokens[12] = {464, 3139, 286, 4486, 318, 11307, 13, 383, 3139, 286, 4881, 318};
+
+  // cl_mem result = gpt(cl, model, state, past, 0, tokens[0]);
+  // float* result_host = malloc(cfg.embed_size * sizeof(float));
+  // CL_CHECK(clEnqueueReadBuffer(cl->command_queue, result, CL_TRUE, 0, cfg.embed_size * sizeof(float), result_host, 0, NULL, NULL));
+  // CL_CHECK(clFlush(cl->command_queue));
+  // CL_CHECK(clFinish(cl->command_queue));
+  // // for (int i = cfg.embed_size - 3; i < cfg.embed_size; i++) {
+  // for (int i = 0; i < 20; i++) {
+  //   printf("%f ", result_host[i]);
+  // }
+  // printf("\n");
+
   for (int i = 0; i < 12; i++) {
     cl_mem result = gpt(cl, model, state, past, i, tokens[i]);
-
     float* result_host = malloc(cfg.vocab_size * sizeof(float));
     CL_CHECK(clEnqueueReadBuffer(cl->command_queue, result, CL_TRUE, 0, cfg.vocab_size * sizeof(float), result_host, 0, NULL, NULL));
     CL_CHECK(clFlush(cl->command_queue));
     CL_CHECK(clFinish(cl->command_queue));
-
-    for (int i = 0; i < 3; i++) {
-      printf("%f ", result_host[i]);
-    }
-    printf("\n");
   }
 
   float* result = malloc(cfg.vocab_size * sizeof(float));
@@ -450,15 +486,14 @@ int main() {
   printf("BENCHMARKING, T=1...\n");
   BENCHMARK(NUM_SAMPLES, ({
     cl_mem cl_result = gpt(cl, model, state, past, 0, 0);
-    CL_CHECK(clEnqueueReadBuffer(cl->command_queue, state->out, CL_TRUE, 0, cfg.vocab_size * sizeof(float), result, 0, NULL, NULL));
     CL_CHECK(clFlush(cl->command_queue));
     CL_CHECK(clFinish(cl->command_queue));
   }));
 
-  // printf("BENCHMARKING, T=%lu...\n", cfg.context_size);
-  // BENCHMARK(NUM_SAMPLES, ({
-  //   cl_mem result = gpt(cl, model, state, past, cfg.context_size-1, 0);
-  //   CL_CHECK(clFlush(cl->command_queue));
-  //   CL_CHECK(clFinish(cl->command_queue));
-  // }));
+  printf("BENCHMARKING, T=%lu...\n", cfg.context_size);
+  BENCHMARK(NUM_SAMPLES, ({
+    cl_mem result = gpt(cl, model, state, past, cfg.context_size-1, 0);
+    CL_CHECK(clFlush(cl->command_queue));
+    CL_CHECK(clFinish(cl->command_queue));
+  }));
 }
