@@ -394,12 +394,15 @@ cl_mem gpt(CL* cl, GPT2* model, State* state, cl_mem past, int past_len, int tok
 
 // Main
 
-#define NUM_SAMPLES 1000
-#define BENCHMARK(n, expr) ({ \
+#define BENCHMARK(n, m, expr) ({ \
   struct timeval tv; \
   gettimeofday(&tv, NULL); \
   unsigned long start_time = 1000000 * tv.tv_sec + tv.tv_usec; \
-  for (int i = 0; i < (n); i++) { expr; } \
+  for (int i = 0; i < n; i++) { \
+    for (int j = 0; j < m; j++) { expr; } \
+    CL_CHECK(clFlush(cl->command_queue)); \
+    CL_CHECK(clFinish(cl->command_queue)); \
+  } \
   gettimeofday(&tv, NULL); \
   unsigned long end_time = 1000000 * tv.tv_sec + tv.tv_usec; \
   double elapsed_time = (double)(end_time - start_time) / 1000000; \
@@ -437,17 +440,6 @@ int main() {
   cl_mem past = init_cl_buffer(cl, NULL, 2 * cfg.num_layers * cfg.context_size * cfg.embed_size, CL_MEM_READ_WRITE);
   int tokens[12] = {464, 3139, 286, 4486, 318, 11307, 13, 383, 3139, 286, 4881, 318};
 
-  // cl_mem result = gpt(cl, model, state, past, 0, tokens[0]);
-  // float* result_host = malloc(cfg.embed_size * sizeof(float));
-  // CL_CHECK(clEnqueueReadBuffer(cl->command_queue, result, CL_TRUE, 0, cfg.embed_size * sizeof(float), result_host, 0, NULL, NULL));
-  // CL_CHECK(clFlush(cl->command_queue));
-  // CL_CHECK(clFinish(cl->command_queue));
-  // // for (int i = cfg.embed_size - 3; i < cfg.embed_size; i++) {
-  // for (int i = 0; i < 20; i++) {
-  //   printf("%f ", result_host[i]);
-  // }
-  // printf("\n");
-
   for (int i = 0; i < 12; i++) {
     cl_mem result = gpt(cl, model, state, past, i, tokens[i]);
     float* result_host = malloc(cfg.vocab_size * sizeof(float));
@@ -468,17 +460,16 @@ int main() {
   assert(argmax == 6342);  // Paris
   printf("DONE\n");
 
+  size_t warp_size;
+  clGetKernelWorkGroupInfo(cl->kernels.norm_a, cl->devices[0], CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(size_t), &warp_size, NULL);
+  printf("WARP SIZE: %zu\n", warp_size);
+
+  printf("BENCHMARKING LAYERNORM...\n");
+  BENCHMARK(1000, cfg.num_layers, norm(cl, state, &model->ln1, 0, state->x));
+
   printf("BENCHMARKING, T=1...\n");
-  BENCHMARK(NUM_SAMPLES, ({
-    cl_mem cl_result = gpt(cl, model, state, past, 0, 0);
-    CL_CHECK(clFlush(cl->command_queue));
-    CL_CHECK(clFinish(cl->command_queue));
-  }));
+  BENCHMARK(100, 1, gpt(cl, model, state, past, 0, 0));
 
   printf("BENCHMARKING, T=%lu...\n", cfg.context_size);
-  BENCHMARK(NUM_SAMPLES, ({
-    cl_mem result = gpt(cl, model, state, past, cfg.context_size-1, 0);
-    CL_CHECK(clFlush(cl->command_queue));
-    CL_CHECK(clFinish(cl->command_queue));
-  }));
+  BENCHMARK(100, 1, gpt(cl, model, state, past, cfg.context_size-1, 0));
 }
