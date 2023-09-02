@@ -3,7 +3,7 @@
   if (i < (n)) { out = (expr); } \
 })
 
-#define SUM(lid, local_size) ({ \
+#define SUM(lid, local_size, local_data) ({ \
   for (int i = local_size/2; i > 0; i >>= 1) { \
     if (lid < i) \
       local_data[lid] += local_data[lid + i]; \
@@ -87,22 +87,12 @@ __kernel void norm_a(__global float* output, __global float* input, __local floa
   int global_size = get_global_size(0);
   int num_blocks = global_size / local_size;
 
-  // Load the data
+  // Load the data, compute partial sums, and store
   local_data[lid] = input[gid];
   barrier(CLK_LOCAL_MEM_FENCE);
-
-  // Compute partial sums
-  for (int i = local_size/2; i > 0; i >>= 1) {
-    if (lid < i) {
-      local_data[lid] += local_data[lid + i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-
-  // Store partial sums
-  if (lid == 0) {
+  SUM(lid, local_size, local_data);
+  if (lid == 0)
     output[gid / local_size] = local_data[0] / local_size;
-  }
 }
 
 __kernel void norm_b(__global float* output, __global float* input, __local float* local_data) {
@@ -112,36 +102,19 @@ __kernel void norm_b(__global float* output, __global float* input, __local floa
   int global_size = get_global_size(0);
   int num_blocks = global_size / local_size;
 
-  // Load the partial sums from all blocks
+  // Load the partial sums from all blocks and compute the final mean
   local_data[lid] = lid < num_blocks ? output[lid] : 0;
   barrier(CLK_LOCAL_MEM_FENCE);
-
-  // Compute the final sum
-  for (int i = local_size/2; i > 0; i >>= 1) {
-    if (lid < i) {
-      local_data[lid] += local_data[lid + i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
+  SUM(lid, local_size, local_data);
   float mean = local_data[0] / num_blocks;
 
-  // Load the data and compute distances
+  // Load the data, compute partial sums, and store
   float dist = input[gid] - mean;
   local_data[lid] = dist * dist;
   barrier(CLK_LOCAL_MEM_FENCE);
-
-  // Compute partial sums
-  for (int i = local_size/2; i > 0; i >>= 1) {
-    if (lid < i) {
-      local_data[lid] += local_data[lid + i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-
-  // Store partial variances
-  if (lid == 0) {
+  SUM(lid, local_size, local_data);
+  if (lid == 0)
     output[num_blocks + gid / local_size] = local_data[0] / local_size;
-  }
 }
 
 __kernel void norm_c(__global float* output, __global float* partials, __global float* weight, __global float* bias, __global float* input, __local float* local_data, int offset) {
@@ -151,49 +124,20 @@ __kernel void norm_c(__global float* output, __global float* partials, __global 
   int global_size = get_global_size(0);
   int num_blocks = global_size / local_size;
 
-  // Load the partial sums from all blocks
+  // Load the partial sums from all blocks and compute the final mean
   local_data[lid] = lid < num_blocks ? partials[lid] : 0;
   barrier(CLK_LOCAL_MEM_FENCE);
-
-  // Compute the final sum
-  for (int i = local_size/2; i > 0; i >>= 1) {
-    if (lid < i) {
-      local_data[lid] += local_data[lid + i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
+  SUM(lid, local_size, local_data);
   float mean = local_data[0] / num_blocks;
 
-  // Load the partial variances from all blocks
+  // Load the partial sums from all blocks and compute the final variance
   local_data[lid] = lid < num_blocks ? partials[num_blocks + lid] : 0;
   barrier(CLK_LOCAL_MEM_FENCE);
-
-  // Compute the final sum
-  for (int i = local_size/2; i > 0; i >>= 1) {
-    if (lid < i) {
-      local_data[lid] += local_data[lid + i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
+  SUM(lid, local_size, local_data);
   float var = local_data[0] / num_blocks;
   float std = sqrt(var) + 1e-5; // epsilon
 
   // Normalize, apply gamma/beta, and store
   float y = (input[gid] - mean) / std;
   output[gid] = y * weight[offset + gid] + bias[offset + gid];
-}
-
-__kernel void norm(__global float* result, __global float* weight, __global float* bias, __global float* x, __local float* local_data, int offset) {
-  int tx = get_global_id(0);
-  int size = get_global_size(0);
-  float mean = 0, var = 0;
-  for (int i = 0; i < size; i++) {
-    mean += x[i] / size;
-  }
-  for (int i = 0; i < size; i++) {
-    var += (x[i] - mean) * (x[i] - mean) / size;
-  }
-  float std = sqrt(var) + 1e-5; // epsilon
-  float y = (x[tx] - mean) / std;
-  result[tx] = y * weight[offset + tx] + bias[offset + tx];
 }

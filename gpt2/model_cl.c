@@ -89,7 +89,6 @@ typedef struct {
   cl_kernel matvmul;
   cl_kernel embedding;
   cl_kernel softmax;
-  cl_kernel norm;
   cl_kernel norm_a;
   cl_kernel norm_b;
   cl_kernel norm_c;
@@ -132,7 +131,6 @@ void init_cl_kernels(CL* cl, char* cl_source) {
   cl->kernels.matvmul = CL_CHECK_ERR(clCreateKernel(program, "matvmul", &err));
   cl->kernels.embedding = CL_CHECK_ERR(clCreateKernel(program, "embedding", &err));
   cl->kernels.softmax = CL_CHECK_ERR(clCreateKernel(program, "softmax", &err));
-  cl->kernels.norm = CL_CHECK_ERR(clCreateKernel(program, "norm", &err));
   cl->kernels.norm_a = CL_CHECK_ERR(clCreateKernel(program, "norm_a", &err));
   cl->kernels.norm_b = CL_CHECK_ERR(clCreateKernel(program, "norm_b", &err));
   cl->kernels.norm_c = CL_CHECK_ERR(clCreateKernel(program, "norm_c", &err));
@@ -317,19 +315,6 @@ cl_mem softmax(CL* cl, cl_mem x, size_t n_rows, size_t n_cols) {
   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.softmax, 1, NULL, &wg.global_size, &wg.local_size, 0, NULL, NULL));
   return x;
 }
-
-// cl_mem norm(CL* cl, State* state, LayerNorm* norm, int layer, cl_mem x) {
-//   cl_mem result = state->ln_out;
-//   size_t offset = layer * norm->size;
-//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 0, sizeof(cl_mem), &result));
-//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 1, sizeof(cl_mem), &norm->weight));
-//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 2, sizeof(cl_mem), &norm->bias));
-//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 3, sizeof(cl_mem), &x));
-//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 4, sizeof(float) * local_size, NULL));
-//   CL_CHECK(clSetKernelArg(cl->kernels.norm, 5, sizeof(int), &offset));
-//   CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.norm, 1, NULL, &norm->size, &local_size, 0, NULL, NULL));
-//   return result;
-// }
 
 cl_mem norm(CL* cl, State* state, LayerNorm* norm, int layer, cl_mem x) {
   CL_CHECK(clSetKernelArg(cl->kernels.norm_a, 0, sizeof(cl_mem), &state->ln_part));
