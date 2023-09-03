@@ -20,6 +20,16 @@
   local_data[0]; \
 })
 
+// This only seems to work without barriers when local_size <= 32
+// #define SUM(thread_idx, local_size, local_data) ({ \
+//   if (thread_idx < 16) local_data[thread_idx] += local_data[thread_idx + 16]; \
+//   if (thread_idx < 8) local_data[thread_idx] += local_data[thread_idx + 8]; \
+//   if (thread_idx < 4) local_data[thread_idx] += local_data[thread_idx + 4]; \
+//   if (thread_idx < 2) local_data[thread_idx] += local_data[thread_idx + 2]; \
+//   if (thread_idx < 1) local_data[thread_idx] += local_data[thread_idx + 1]; \
+//   local_data[0]; \
+// })
+
 __kernel void copy(__global float* dst, __global float* src, int dst_offset, int src_offset, int dst_stride, int src_stride) {
   int col = get_local_id(0);
   int row = get_global_id(0) / get_local_size(0);
@@ -51,6 +61,31 @@ __kernel void matmul(__global float* result, __global float* A, __global float* 
     result[aisle * n_rows + row] = value;
   }
 }
+
+__kernel void matmul_a(__global float* result, __global float* A, __global float* x, __local float* local_data,
+                       int n_aisles, int n_rows, int n_cols, int A_offset, int x_offset, int A_stride) {
+  GLOBALS;
+  int row = (global_idx / n_cols) % n_rows;
+  int aisle = (global_idx / n_cols) / n_rows;
+  local_data[thread_idx] = A[A_offset + (aisle * A_stride) + (row * n_cols) + (global_idx % n_cols)] * x[x_offset + (aisle * n_cols) + (global_idx % n_cols)];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  float sum = SUM(thread_idx, block_dim, local_data);
+  if (thread_idx == 0)
+    result[block_idx] = sum;
+}
+
+__kernel void matmul_b(__global float* result, __global float* partials, __local float* local_data, int chunks_per_row) {
+  GLOBALS;
+  int row = global_idx / chunks_per_row;
+  local_data[thread_idx] = thread_idx < chunks_per_row ? partials[row * chunks_per_row + thread_idx] : 0;
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  float sum = SUM(thread_idx, block_dim, local_data);
+  if (thread_idx == 0)
+    result[block_idx] = sum;
+}
+
 __kernel void matvmul(__global float* result, __global float* x, __global float* A, int n_aisles, int n_rows, int n_cols, int x_offset, int A_offset, int A_stride) {
   int gid = get_global_id(0);
   int col = gid % n_cols;
@@ -95,8 +130,8 @@ __kernel void norm_a(__global float* output, __global float* input, __local floa
   // Load the data and compute partial sums for mean
   local_data[thread_idx] = input[global_idx];
   barrier(CLK_LOCAL_MEM_FENCE);
-  float sum = SUM(thread_idx, block_dim, local_data);
 
+  float sum = SUM(thread_idx, block_dim, local_data);
   if (thread_idx == 0)
     output[block_idx] = sum / block_dim;
 }
@@ -113,6 +148,7 @@ __kernel void norm_b(__global float* output, __global float* input, __local floa
   float dist = input[global_idx] - mean;
   local_data[thread_idx] = dist * dist;
   barrier(CLK_LOCAL_MEM_FENCE);
+
   float sum = SUM(thread_idx, block_dim, local_data);
   if (thread_idx == 0) {
     output[grid_dim + block_idx] = sum / block_dim;

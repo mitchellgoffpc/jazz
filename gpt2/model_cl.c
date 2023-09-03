@@ -86,6 +86,8 @@ typedef struct {
   cl_kernel scale;
   cl_kernel gelu;
   cl_kernel matmul;
+  cl_kernel matmul_a;
+  cl_kernel matmul_b;
   cl_kernel matvmul;
   cl_kernel embedding;
   cl_kernel softmax;
@@ -128,6 +130,8 @@ void init_cl_kernels(CL* cl, char* cl_source) {
   cl->kernels.scale = CL_CHECK_ERR(clCreateKernel(program, "scale", &err));
   cl->kernels.gelu = CL_CHECK_ERR(clCreateKernel(program, "gelu", &err));
   cl->kernels.matmul = CL_CHECK_ERR(clCreateKernel(program, "matmul", &err));
+  cl->kernels.matmul_a = CL_CHECK_ERR(clCreateKernel(program, "matmul_a", &err));
+  cl->kernels.matmul_b = CL_CHECK_ERR(clCreateKernel(program, "matmul_b", &err));
   cl->kernels.matvmul = CL_CHECK_ERR(clCreateKernel(program, "matvmul", &err));
   cl->kernels.embedding = CL_CHECK_ERR(clCreateKernel(program, "embedding", &err));
   cl->kernels.softmax = CL_CHECK_ERR(clCreateKernel(program, "softmax", &err));
@@ -283,6 +287,31 @@ cl_mem matmul(CL* cl, cl_mem result, cl_mem A, cl_mem x, size_t n_aisles, size_t
   return result;
 }
 
+cl_mem matmulx(CL* cl, cl_mem result, cl_mem partials, cl_mem A, cl_mem x,
+               size_t n_aisles, size_t n_rows, size_t n_cols, size_t A_offset, size_t x_offset, size_t A_stride) {
+  Workgroup wg1 = get_workgroup(n_aisles * n_rows * n_cols);
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 0, sizeof(cl_mem), &partials));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 1, sizeof(cl_mem), &A));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 2, sizeof(cl_mem), &x));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 3, sizeof(float) * local_size, NULL));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 4, sizeof(int), &n_aisles));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 5, sizeof(int), &n_rows));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 6, sizeof(int), &n_cols));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 7, sizeof(int), &A_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 8, sizeof(int), &x_offset));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_a, 9, sizeof(int), &A_stride));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.matmul_a, 1, NULL, &wg1.global_size, &wg1.local_size, 0, NULL, NULL));
+
+  size_t chunks_per_row = n_cols / wg1.local_size;
+  Workgroup wg2 = get_workgroup(n_aisles * n_rows * chunks_per_row);
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_b, 0, sizeof(cl_mem), &result));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_b, 1, sizeof(cl_mem), &partials));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_b, 2, sizeof(float) * local_size, NULL));
+  CL_CHECK(clSetKernelArg(cl->kernels.matmul_b, 3, sizeof(int), &chunks_per_row));
+  CL_CHECK(clEnqueueNDRangeKernel(cl->command_queue, cl->kernels.matmul_b, 1, NULL, &wg2.global_size, &chunks_per_row, 0, NULL, NULL));
+  return result;
+}
+
 cl_mem matvmul(CL* cl, cl_mem result, cl_mem x, cl_mem A, size_t n_aisles, size_t n_rows, size_t n_cols, size_t x_offset, size_t A_offset, size_t A_stride) {
   Workgroup wg = get_workgroup(n_aisles * n_cols);
   CL_CHECK(clSetKernelArg(cl->kernels.matvmul, 0, sizeof(cl_mem), &result));
@@ -409,6 +438,14 @@ cl_mem gpt(CL* cl, GPT2* model, State* state, cl_mem past, int past_len, int tok
   printf("DONE, %f.2 it/s\n", n / elapsed_time); \
 })
 
+float* read(CL* cl, size_t n, cl_mem data) {
+  float* result = malloc(n * sizeof(float));
+  CL_CHECK(clEnqueueReadBuffer(cl->command_queue, data, CL_TRUE, 0, n * sizeof(float), result, 0, NULL, NULL));
+  CL_CHECK(clFlush(cl->command_queue));
+  CL_CHECK(clFinish(cl->command_queue));
+  return result;
+}
+
 int main() {
   CL* cl = malloc(sizeof(CL));
   GPT2* model = malloc(sizeof(GPT2));
@@ -441,18 +478,10 @@ int main() {
   int tokens[12] = {464, 3139, 286, 4486, 318, 11307, 13, 383, 3139, 286, 4881, 318};
 
   for (int i = 0; i < 12; i++) {
-    cl_mem result = gpt(cl, model, state, past, i, tokens[i]);
-    float* result_host = malloc(cfg.vocab_size * sizeof(float));
-    CL_CHECK(clEnqueueReadBuffer(cl->command_queue, result, CL_TRUE, 0, cfg.vocab_size * sizeof(float), result_host, 0, NULL, NULL));
-    CL_CHECK(clFlush(cl->command_queue));
-    CL_CHECK(clFinish(cl->command_queue));
+    gpt(cl, model, state, past, i, tokens[i]);
   }
 
-  float* result = malloc(cfg.vocab_size * sizeof(float));
-  CL_CHECK(clEnqueueReadBuffer(cl->command_queue, state->out, CL_TRUE, 0, cfg.vocab_size * sizeof(float), result, 0, NULL, NULL));
-  CL_CHECK(clFlush(cl->command_queue));
-  CL_CHECK(clFinish(cl->command_queue));
-
+  float* result = read(cl, cfg.vocab_size, state->out);
   int argmax = 0;
   for (int i = 0; i < cfg.vocab_size; i++) {
     argmax = result[i] > result[argmax] ? i : argmax;
@@ -460,12 +489,27 @@ int main() {
   assert(argmax == 6342);  // Paris
   printf("DONE\n");
 
+  // Test matmul
+  float* result_a = read(cl, cfg.embed_size, matmul(cl, state->fc1, model->fc1.weight, state->x, 1, cfg.embed_size, cfg.embed_size, 0, 0, 0));
+  for (int i = 0; i < 3; i++) { printf("%f ", result_a[i]); }
+  printf("\n");
+
+  cl_mem partials = init_cl_buffer(cl, NULL, cfg.embed_size * 64 * 4, CL_MEM_READ_WRITE);
+  float* result_b = read(cl, cfg.embed_size, matmulx(cl, state->fc1, partials, model->fc1.weight, state->x, 1, cfg.embed_size, cfg.embed_size, 0, 0, 0));
+  for (int i = 0; i < 3; i++) { printf("%f ", result_b[i]); }
+  printf("\n");
+
+  // Benchmarking
   size_t warp_size;
   clGetKernelWorkGroupInfo(cl->kernels.norm_a, cl->devices[0], CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, sizeof(size_t), &warp_size, NULL);
   printf("WARP SIZE: %zu\n", warp_size);
 
   printf("BENCHMARKING LAYERNORM...\n");
   BENCHMARK(1000, cfg.num_layers, norm(cl, state, &model->ln1, 0, state->x));
+
+  printf("BENCHMARKING MATMUL...\n");
+  BENCHMARK(100, cfg.num_layers, matmul(cl, state->fc1, model->fc1.weight, state->x, 1, model->fc2.out_size, model->fc2.in_size, 0, 0, 0));
+  BENCHMARK(100, cfg.num_layers, matmulx(cl, state->fc1, partials, model->fc1.weight, state->x, 1, model->fc2.out_size, model->fc2.in_size, 0, 0, 0));
 
   printf("BENCHMARKING, T=1...\n");
   BENCHMARK(100, 1, gpt(cl, model, state, past, 0, 0));
