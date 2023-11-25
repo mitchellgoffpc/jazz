@@ -56,6 +56,7 @@ def fix_state_dict(state_dict):
   state_dict['fc_out.weight'] = state_dict['embed_tokens.weight']
   return state_dict
 
+
 def serialize_model(config, state_dict, output_fn):
   def serialize_layer(data):
     f.write(struct.pack('<Q', data.nelement()))
