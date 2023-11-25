@@ -85,12 +85,12 @@ class ResnetBlock(nn.Module):
     self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
     self.norm2 = nn.GroupNorm(32, out_channels)
     self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-    self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+    self.conv_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
 
   def forward(self, x):
     h = self.conv1(F.silu(self.norm1(x)))
     h = self.conv2(F.silu(self.norm2(h)))
-    return self.nin_shortcut(x) + h
+    return self.conv_shortcut(x) + h
 
 class AttnBlock(nn.Module):
   def __init__(self, num_channels):
@@ -110,81 +110,31 @@ class AttnBlock(nn.Module):
 class EncoderBlock(nn.Module):
   def __init__(self, in_channels, out_channels, downsample):
     super().__init__()
-    self.conv1 = ResnetBlock(in_channels, out_channels)
-    self.conv2 = ResnetBlock(out_channels, out_channels)
+    self.res1 = ResnetBlock(in_channels, out_channels)
+    self.res2 = ResnetBlock(out_channels, out_channels)
     self.downsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1) if downsample else None
 
   def forward(self, x):
-    x = self.conv2(self.conv1(x))
+    x = self.res2(self.res1(x))
     if self.downsample:
-      x = self.downsample(x)[:,:,:1:,1:]  # pytorch doesn't allow fancy padding
+      x = self.downsample(x)[:,:,1:,1:]  # pytorch doesn't allow fancy padding
     return x
 
 class DecoderBlock(nn.Module):
   def __init__(self, in_channels, out_channels, upsample):
     super().__init__()
-    self.conv1 = ResnetBlock(in_channels, out_channels)
-    self.conv2 = ResnetBlock(out_channels, out_channels)
-    self.conv3 = ResnetBlock(out_channels, out_channels)
+    self.res1 = ResnetBlock(in_channels, out_channels)
+    self.res2 = ResnetBlock(out_channels, out_channels)
+    self.res3 = ResnetBlock(out_channels, out_channels)
     self.upsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1) if upsample else None
 
   def forward(self, x):
-    x = self.conv3(self.conv2(self.conv1(x)))
+    x = self.res3(self.res2(self.res1(x)))
     if self.upsample:
       B, C, H, W = x.shape
       x = x.view(B, C, H, 1, W, 1).expand(B, C, H, 2, W, 2).reshape(B, C, 2*W, 2*H)
       x = self.upsample(x)
     return x
-
-
-
-# class Lambda(nn.Module):
-#   def __init__(self, f): self.f = f
-#   def forward(self, *x): return self.f(*x)
-#
-# def expand(x):
-#   B, C, H, W = x.shape
-#   return x.view(B, C, H, 1, W, 1).expand(B, C, H, 2, W, 2).view(B, C, 2*W, 2*H)
-#
-# def EncoderBlock(in_channels, out_channels, downsample):
-#   return nn.Sequential(OrderedDict({
-#     'conv1':  ResnetBlock(in_channels, out_channels),
-#     'conv2': ResnetBlock(out_channels, out_channels),
-#     'downsample': nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=(0,1,0,1)) if downsample else nn.Identity()}))
-#
-# def DecoderBlock(in_channels, out_channels, upsample):
-#   return nn.Sequential(OrderedDict({
-#     'conv1': ResnetBlock(in_channels, out_channels),
-#     'conv2': ResnetBlock(out_channels, out_channels),
-#     'conv3': ResnetBlock(out_channels, out_channels),
-#     'expand': Lambda(expand) if upsample else nn.Identity(),
-#     'upsample': nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1) if upsample else nn.Identity()}))
-#
-#
-#
-# class Upsample(nn.Module):
-#   def __init__(self, num_channels):
-#     super().__init__()
-#     self.conv = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
-#
-#   def forward(self, x):
-#     B, C, H, W = x.shape
-#     x = x.view(B, C, H, 1, W, 1).expand(B, C, H, 2, W, 2).view(B, C, 2*W, 2*H)
-#     return self.conv(x)
-#
-# def EncoderBlock(in_channels, out_channels, downsample):
-#   return nn.Sequential(OrderedDict({
-#     'conv1':  ResnetBlock(in_channels, out_channels),
-#     'conv2': ResnetBlock(out_channels, out_channels),
-#     'downsample': nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=(0,1,0,1)) if downsample else nn.Identity()}))
-#
-# def DecoderBlock(in_channels, out_channels, upsample):
-#   return nn.Sequential(OrderedDict({
-#     'conv1': ResnetBlock(in_channels, out_channels),
-#     'conv2': ResnetBlock(out_channels, out_channels),
-#     'conv3': ResnetBlock(out_channels, out_channels),
-#     'upsample': Upsample(out_channels) if upsample else nn.Identity()}))
-
 
 
 class Encoder(nn.Module):
@@ -195,19 +145,21 @@ class Encoder(nn.Module):
     _, out_channels, _ = params[-1]
     self.conv_in = nn.Conv2d(img_channels, in_channels, kernel_size=3, stride=1, padding=1)
     self.blocks = nn.ModuleList([EncoderBlock(*p) for p in params])
-    self.conv1 = ResnetBlock(out_channels, out_channels)
+    self.res1 = ResnetBlock(out_channels, out_channels)
     self.attn = AttnBlock(out_channels)
-    self.conv2 = ResnetBlock(out_channels, out_channels)
+    self.res2 = ResnetBlock(out_channels, out_channels)
     self.norm = nn.GroupNorm(32, out_channels)
     self.conv_out = nn.Conv2d(out_channels, 2*z_channels, kernel_size=3, padding=1)
     self.conv_quant = nn.Conv2d(2*z_channels, 2*z_channels, kernel_size=1)
 
   def forward(self, x):
+    x = x.permute(0,3,1,2).float() / 255
+    x = (x * 2.0) - 1.0
     x = self.conv_in(x)
     for block in self.blocks:
       x = block(x)
-    x = self.conv1(x)
-    x = self.conv2(self.attn(x))
+    x = self.res1(x)
+    x = self.res2(self.attn(x))
     x = self.conv_out(F.silu(self.norm(x)))
     x = self.conv_quant(x)
     return x
@@ -220,9 +172,9 @@ class Decoder(nn.Module):
       _, out_channels, _ = params[-1]
       self.conv_dequant = nn.Conv2d(z_channels, z_channels, kernel_size=1)
       self.conv_in = nn.Conv2d(z_channels, in_channels, kernel_size=3, padding=1)
-      self.conv1 = ResnetBlock(in_channels, in_channels)
+      self.res1 = ResnetBlock(in_channels, in_channels)
       self.attn = AttnBlock(in_channels)
-      self.conv2 = ResnetBlock(in_channels, in_channels)
+      self.res2 = ResnetBlock(in_channels, in_channels)
       self.blocks = nn.ModuleList([DecoderBlock(*p) for p in params])
       self.norm = nn.GroupNorm(32, out_channels)
       self.conv_out = nn.Conv2d(out_channels, img_channels, kernel_size=3, padding=1)
@@ -230,9 +182,11 @@ class Decoder(nn.Module):
     def forward(self, x):
       x = self.conv_dequant(x)
       x = self.conv_in(x)
-      x = self.conv1(x)
-      x = self.conv2(self.attn(x))
+      x = self.res1(x)
+      x = self.res2(self.attn(x))
       for block in self.blocks:
         x = block(x)
       x = self.conv_out(F.silu(self.norm(x)))
+      x = (x + 1.0) / 2.0
+      x = x.permute(0,2,3,1).clip(0,1) * 255
       return x
