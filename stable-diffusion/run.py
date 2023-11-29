@@ -7,7 +7,8 @@ import requests
 import tiktoken
 from pathlib import Path
 from tqdm import tqdm, trange
-from model import CLIPConfig, SDConfig, CLIPEncoder, Encoder, Decoder
+from model import CLIPConfig, SDConfig, CLIPEncoder, Encoder, Decoder, UNet
+from tokenizer import CLIPTokenizer
 
 def load_checkpoint(weights_urls, checkpoint_fns):
   state_dict = {}
@@ -66,6 +67,7 @@ def fix_clip_state_dict(state_dict):
   state_dict.pop('position_ids', None)
   return state_dict
 
+
 def fix_vae_state_dict(state_dict):
   replacements = {
     'mid_block.': '',
@@ -98,6 +100,37 @@ def fix_vae_state_dict(state_dict):
   return state_dicts
 
 
+def fix_unet_state_dict(state_dict):
+  replacements = {
+    'time_embedding.linear_1.': 'embed_t_fc1.',
+    'time_embedding.linear_2.': 'embed_t_fc2.',
+    'conv_norm_out.': 'norm_out.',
+    'resnets.0.': 'res1.',
+    'resnets.1.': 'res2.',
+    'resnets.2.': 'res3.',
+    'attentions.0.': 'attn1.',
+    'attentions.1.': 'attn2.',
+    'attentions.2.': 'attn3.',
+    'downsamplers.0.': 'downsample.',
+    'upsamplers.0.': 'upsample.',
+    'transformer_blocks.0.': '',
+    'to_q.': 'q.',
+    'to_k.': 'k.',
+    'to_v.': 'v.',
+    'to_out.0.': 'proj.',
+    'proj_out.': 'proj.',
+    'ff.net.0.': 'geglu.',
+    'ff.net.2.': 'fc.',
+    'time_emb_proj.': 'fc_embed.',
+    'attn1.norm.': 'attn1.norm_in.',
+    'attn2.norm.': 'attn2.norm_in.',
+    'attn3.norm.': 'attn3.norm_in.',
+  }
+  for src, dst in replacements.items():
+    state_dict = {k.replace(src, dst): v for k,v in state_dict.items()}
+  return state_dict
+
+
 CONFIGS = {
   'v1.4': SDConfig(),
   'v1.5': SDConfig()}
@@ -109,8 +142,7 @@ REPOS = {
 COMPONENTS = {
   'text_encoder': 'text_encoder/model',
   'vae': 'vae/diffusion_pytorch_model',
-  # 'unet': 'unet/diffusion_pytorch_model'
-}
+  'unet': 'unet/diffusion_pytorch_model'}
 
 if __name__ == '__main__':
   device = 'cpu'
@@ -127,9 +159,10 @@ if __name__ == '__main__':
   text_encoder = CLIPEncoder(config).to(device)
   text_encoder.load_state_dict(fix_clip_state_dict(state_dict['text_encoder']))
 
-  context = torch.randint(0, config.vocab_size, size=(1, config.context_size)).to(device)
+  context = CLIPTokenizer().encode('A cat lying on the grass')
+  context = torch.tensor(context, dtype=torch.int32).to(device)[None]
   with torch.no_grad():
-    data = text_encoder(context)
+    text_features = text_encoder(context)
 
   # Load image encoder/decoder
   encoder = Encoder(3, 4).to(device)
@@ -139,6 +172,7 @@ if __name__ == '__main__':
   encoder.load_state_dict(vae_state_dict['encoder'])
   decoder.load_state_dict(vae_state_dict['decoder'])
 
+  """
   import cv2
   import numpy as np
   import matplotlib.pyplot as plt
@@ -155,4 +189,44 @@ if __name__ == '__main__':
   _, ax = plt.subplots(1, 2, figsize=(8, 4))
   ax[0].imshow(img)
   ax[1].imshow(pred)
+  plt.show()
+  """
+
+  # Load diffusion model
+  model = UNet().to(device)
+  model.load_state_dict(fix_unet_state_dict(state_dict['unet']))
+
+  import math
+  steps = 50
+  latent = torch.randn(1, 4, 64, 64)
+  timesteps = torch.tensor(range(1, 1000, 1000//steps), dtype=torch.int32)
+  alphas = torch.ones(len(timesteps))
+  alphas_prev = torch.cat([torch.tensor([1.0]), alphas[:-1]])
+
+  with torch.no_grad():
+    for index, timestep in tqdm(list(enumerate(timesteps))[::-1]):
+      e_t = model(latent, timestep, text_features)
+
+      x = latent
+      a_t = alphas[index]
+      a_prev = alphas_prev[index]
+      temperature = 1
+      sigma_t = 0
+      sqrt_one_minus_at = (1-a_t).sqrt()
+
+      pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+
+      # direction pointing to x_t
+      dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
+
+      x_prev = a_prev.sqrt() * pred_x0 + dir_xt
+      latent = x_prev
+      print(latent.mean())
+
+  import numpy as np
+  import matplotlib.pyplot as plt
+  with torch.no_grad():
+    pred = decoder(latent)
+  pred = pred.cpu().numpy().astype(np.uint8)[0]
+  plt.imshow(pred)
   plt.show()
