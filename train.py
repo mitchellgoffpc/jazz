@@ -25,27 +25,26 @@ OPTIMIZERS = {'Adam': torch.optim.Adam, 'AdamW': torch.optim.AdamW}
 
 @dataclass
 class Config:
-    optim: str = 'Adam'
+    num_epochs: int = 1000
     batch_size: int = 8
     learning_rate: float = 3e-5
+    val_split: float = 0.1
+    optim: str = 'Adam'
+    model: GPTConfig = field(default_factory=GPTConfig)
+
+    data_path: str = '/raid.unprotected/datasets/shakespeare'
     checkpoint_path: Optional[str] = None
     save: bool = True
-    data_path: str = '/raid.unprotected/datasets/shakespeare'
-    val_split: float = 0.1  # New argument for validation split
-    model: GPTConfig = field(default_factory=GPTConfig)
+    save_every: int = 10
 
 
 def get_dataloader(config, rank, train=True):
     dataset = TextDataset(config.data_path, config.model.context_size)
     num_samples = len(dataset) // config.model.context_size
     indices = torch.randperm(len(dataset))[:num_samples]
-    
+
     split_idx = int(len(indices) * (1 - config.val_split))
-    if train:
-        subset_indices = indices[:split_idx]
-    else:
-        subset_indices = indices[split_idx:]
-    
+    subset_indices = indices[:split_idx] if train else indices[split_idx:]
     subset = Subset(dataset, subset_indices)    
     sampler = DistributedSampler(subset)
     return DataLoader(subset, batch_size=config.batch_size, num_workers=4, pin_memory=True, sampler=sampler)
@@ -65,6 +64,9 @@ def train(rank, world_size, config, result_path):
     optimizer = OPTIMIZERS[config.optim](model.parameters(), lr=config.learning_rate)
     if config.checkpoint_path:
         model.load_state_dict(torch.load(config.checkpoint_path))
+    if rank == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Model parameters: {total_params:,}")
 
     # Load the dataset
     train_loader = get_dataloader(config, rank, train=True)
@@ -85,7 +87,7 @@ def train(rank, world_size, config, result_path):
             writer.writerow(['epoch', 'train_loss', 'val_loss', 'epoch_duration'])
 
     # Training loop
-    for epoch in range(100):
+    for epoch in range(config.num_epochs):
         model.train()
         train_loss = 0
         epoch_start_time = time.time()
@@ -131,9 +133,10 @@ def train(rank, world_size, config, result_path):
                 writer.writerow([epoch, train_loss, val_loss, epoch_duration])
 
         # Save the model checkpoint
-        if save_experiment:
+        if save_experiment and epoch % config.save_every == 0:
             state_dict = {k:v.cpu() for k,v in model.state_dict().items()}
             torch.save(state_dict, result_path / f'checkpoint_{epoch}.ckpt')
+
 
 if __name__ == '__main__':
     os.environ['MASTER_ADDR'] = 'localhost'
