@@ -18,7 +18,7 @@ from torch.utils.data import Subset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from gpt2.model import GPTConfig, GPT
+from models.gpt import GPTConfig, GPT
 from datasets.text import TextDataset
 
 OPTIMIZERS = {'Adam': torch.optim.Adam, 'AdamW': torch.optim.AdamW}
