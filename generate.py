@@ -7,7 +7,7 @@ import torch
 import requests
 import tiktoken
 from tqdm import tqdm, trange
-from gpt import GPT, GPTConfig
+from models.gpt import GPT, GPTConfig
 
 def load_checkpoint(weights_url, checkpoint_fn):
   tmp_checkpoint_fn = f'{checkpoint_fn}.tmp'
