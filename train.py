@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field
+from safetensors.torch import save_file
 
 import torch
 import torch.nn.functional as F
@@ -25,9 +26,9 @@ OPTIMIZERS = {'Adam': torch.optim.Adam, 'AdamW': torch.optim.AdamW}
 
 @dataclass
 class Config:
-    num_epochs: int = 1000
+    num_epochs: int = 10
     batch_size: int = 8
-    learning_rate: float = 3e-5
+    learning_rate: float = 3e-4
     val_split: float = 0.1
     optim: str = 'Adam'
     model: GPTConfig = field(default_factory=GPTConfig)
@@ -35,17 +36,17 @@ class Config:
     data_path: str = '/raid.unprotected/datasets/shakespeare'
     checkpoint_path: Optional[str] = None
     save: bool = True
-    save_every: int = 10
+    save_every: int = 1
 
 
 def get_dataloader(config, rank, train=True):
-    dataset = TextDataset(config.data_path, config.model.context_size)
-    num_samples = len(dataset) // config.model.context_size
+    dataset = TextDataset(config.data_path, config.model.context_size + 1)
+    num_samples = len(dataset) // (config.model.context_size + 1)
     indices = torch.randperm(len(dataset))[:num_samples]
 
     split_idx = int(len(indices) * (1 - config.val_split))
     subset_indices = indices[:split_idx] if train else indices[split_idx:]
-    subset = Subset(dataset, subset_indices)    
+    subset = Subset(dataset, subset_indices)
     sampler = DistributedSampler(subset)
     return DataLoader(subset, batch_size=config.batch_size, num_workers=4, pin_memory=True, sampler=sampler)
 
@@ -92,13 +93,13 @@ def train(rank, world_size, config, result_path):
         train_loss = 0
         epoch_start_time = time.time()
 
-        for inputs in (pbar := tqdm(train_loader, leave=False, disable=rank>0)):
+        for tokens in (pbar := tqdm(train_loader, leave=False, disable=rank>0)):
             start_time = time.time()
-            inputs = inputs.to(device, non_blocking=True)
+            tokens = tokens.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = F.cross_entropy(outputs.view(-1, outputs.size(-1)), inputs.view(-1))
+            outputs = model(tokens[:, :-1])
+            loss = F.cross_entropy(outputs.flatten(end_dim=1), tokens[:, 1:].flatten())
             loss.backward()
             optimizer.step()
 
@@ -109,10 +110,10 @@ def train(rank, world_size, config, result_path):
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for inputs in (pbar := tqdm(val_loader, leave=False, disable=rank>0)):
-                inputs = inputs.to(device, non_blocking=True)
-                outputs = model(inputs)
-                loss = F.cross_entropy(outputs.view(-1, outputs.size(-1)), inputs.view(-1))
+            for tokens in (pbar := tqdm(val_loader, leave=False, disable=rank>0)):
+                tokens = tokens.to(device)
+                outputs = model(tokens[:, :-1])
+                loss = F.cross_entropy(outputs.flatten(end_dim=1), tokens[:, 1:].flatten())
                 val_loss += loss.item()
                 pbar.set_description(f"Epoch {epoch} | Val Loss: {loss.item():.4f}")
 
@@ -134,8 +135,8 @@ def train(rank, world_size, config, result_path):
 
         # Save the model checkpoint
         if save_experiment and epoch % config.save_every == 0:
-            state_dict = {k:v.cpu() for k,v in model.state_dict().items()}
-            torch.save(state_dict, result_path / f'checkpoint_{epoch}.ckpt')
+            state_dict = {k.removeprefix('module.'): v.cpu() for k, v in model.state_dict().items()}
+            save_file(state_dict, result_path / f'checkpoint_{epoch}.safetensors')
 
 
 if __name__ == '__main__':

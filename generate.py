@@ -4,8 +4,10 @@ import sys
 import json
 import struct
 import torch
+import argparse
 import requests
 import tiktoken
+import safetensors
 from tqdm import tqdm, trange
 from models.gpt import GPT, GPTConfig
 
@@ -64,68 +66,42 @@ def fix_state_dict(state_dict):
     return state_dict
 
 
-def serialize_model(config, state_dict, output_fn):
-    def serialize_layer(data):
-        f.write(struct.pack('<Q', data.nelement()))
-        f.write(data.numpy().tobytes())
-
-    def serialize_block(key):
-        serialize_layer(torch.stack([state_dict[f'blocks.{i}.{key}.weight'] for i in range(config.num_layers)], dim=0))
-        serialize_layer(torch.stack([state_dict[f'blocks.{i}.{key}.bias'] for i in range(config.num_layers)], dim=0))
-
-    with open(output_fn, 'wb') as f:
-        f.write(struct.pack('<Q', len(state_dict)))
-        f.write(struct.pack('<5Q', config.num_layers, config.num_heads, config.embed_size, config.vocab_size, config.context_size))
-
-        serialize_layer(state_dict['embed_tokens.weight'])
-        serialize_layer(state_dict['embed_pos.weight'])
-        serialize_block('ln1')
-        serialize_block('ln2')
-        serialize_block('attn.qkv')
-        serialize_block('attn.proj')
-        serialize_block('mlp.fc1')
-        serialize_block('mlp.fc2')
-        serialize_layer(state_dict['ln.weight'])
-        serialize_layer(state_dict['ln.bias'])
-        serialize_layer(state_dict['fc_out.weight'])
-
-
 if __name__ == '__main__':
-    model = sys.argv[1]
-    assert model in CONFIGS
+    parser = argparse.ArgumentParser(description='GPT model generator')
+    parser.add_argument('model', choices=CONFIGS.keys(), help='Model configuration to use')
+    parser.add_argument('-f', '--file', help='Path to the checkpoint file to load')
+    parser.add_argument('-b', '--benchmark', action='store_true', help='Run a benchmark')
+    parser.add_argument('-p', '--prompt', help='Prompt to generate completion for')
+    args = parser.parse_args()
 
-    # Load weights
-    weights_url = f'https://huggingface.co/{model}/resolve/main/model.safetensors'
-    checkpoint_fn = f'/tmp/{model}.safetensors'
-    state_dict = load_checkpoint(weights_url, checkpoint_fn)
-    state_dict = fix_state_dict(state_dict)
+    # Load the checkpoint
+    if args.file:
+        with safetensors.safe_open(args.file, framework="pt", device="cpu") as f:
+            state_dict = {k: f.get_tensor(k) for k in f.keys()}
+    else:
+        weights_url = f'https://huggingface.co/{args.model}/resolve/main/model.safetensors'
+        checkpoint_fn = f'/tmp/{args.model}.safetensors'
+        state_dict = load_checkpoint(weights_url, checkpoint_fn)
+        state_dict = fix_state_dict(state_dict)
 
     # Create the model
-    device = 'cpu'
-    config = CONFIGS[model]
-    model = GPT(config).to(device)
+    device = torch.device('cpu')
+    config = CONFIGS[args.model]
+    model = GPT(config).to(device).eval()
     model.load_state_dict(state_dict)
     tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Run sanity checks
-    prompt = "The capital of Germany is Berlin. The capital of France is"
-    context = torch.tensor(tokenizer.encode(prompt))[None].to(device)
-    result = model.generate(context, num_tokens=2, top_k=10, temperature=1e-6)
-    assert tokenizer.decode(result[0].tolist()[-1:]) == " Paris"
-
-    prompt = "Hi my name is Chris but I have been with Nokia for many years."
-    context = torch.tensor(tokenizer.encode(prompt))[None].to(device)
-    result = model.generate(context, num_tokens=50, top_k=10)
-    print(f"Prompt:    ", prompt)
-    print(f"Completion:", tokenizer.decode(result[0].tolist()))
-
-    # Serialize weights
-    print("Serializing weights...")
-    serialize_model(config, state_dict, '/tmp/weights.bin')
-    print("Done serializing")
-
     # Benchmark
-    large_context = torch.randint(0, 50257, size=(1, 1024)).to(device)
-    with torch.no_grad():
-        for i in trange(1024, desc="benchmarking bs=1, seqlen=1"):
-            data = model(large_context[:,i:i+1])
+    if args.benchmark:
+        large_context = torch.randint(0, 50257, size=(1, 1024)).to(device)
+        with torch.no_grad():
+            for i in trange(1024, desc="benchmarking bs=1, seqlen=1"):
+                data = model(large_context[:,i:i+1])
+
+    # Decode
+    else:
+        prompt = args.prompt or "From fairest creatures"
+        context = torch.tensor(tokenizer.encode(prompt))[None].to(device)
+        result = model.generate(context, num_tokens=50, top_k=10)
+        print(f"Prompt:    ", prompt)
+        print(f"Completion:", tokenizer.decode(result[0].tolist()))
