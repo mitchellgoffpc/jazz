@@ -93,9 +93,6 @@ class GPT(nn.Module):
         x = self.fc_out(self.ln(x))
         return x
 
-    def loss(self, logits, targets):
-        return F.cross_entropy(logits.flatten(end_dim=-1), targets, ignore_index=-1)
-
     @torch.no_grad()
     def generate(self, context, num_tokens=1, temperature=1.0, top_k=-1):
         past = torch.zeros(len(context), self.config.num_layers, self.config.num_heads, 2, self.config.context_size, self.config.embed_size // self.config.num_heads)

@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import os
-import sys
 import json
 import struct
 import torch
@@ -8,20 +7,30 @@ import argparse
 import requests
 import tiktoken
 import safetensors
+from pathlib import Path
 from tqdm import tqdm, trange
 from models.gpt import GPT, GPTConfig
+from models.llama import Llama, LlamaConfig
+
+CHECKPOINT_DIR = Path(__file__).parent / 'pretrained'
+HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
+GPT2_URL = "https://huggingface.co/{model}/resolve/main/model.safetensors"
+LLAMA3_URL = "https://huggingface.co/meta-llama/Meta-Llama-3-{size}/resolve/main/model-{index:05d}-of-00004.safetensors"
 
 CONFIGS = {
     'gpt2': GPTConfig(num_layers=12, num_heads=12, embed_size=768),
     'gpt2-medium': GPTConfig(num_layers=24, num_heads=16, embed_size=1024),
     'gpt2-large': GPTConfig(num_layers=36, num_heads=20, embed_size=1280),
-    'gpt2-xl': GPTConfig(num_layers=48, num_heads=25, embed_size=1600)}
+    'gpt2-xl': GPTConfig(num_layers=48, num_heads=25, embed_size=1600),
+    'llama3-8b': LlamaConfig(num_layers=32, num_heads=32, embed_size=4096)}
 
 
-def load_checkpoint(weights_url, checkpoint_fn):
+def load_checkpoint(weights_url, checkpoint_fn, dtype=torch.float32):
     tmp_checkpoint_fn = f'{checkpoint_fn}.tmp'
     if not os.path.exists(checkpoint_fn):
-        r = requests.get(weights_url, stream=True)
+        headers = {'Authorization': f'Bearer {HUGGINGFACE_API_KEY}'} if HUGGINGFACE_API_KEY else {}
+        r = requests.get(weights_url, headers=headers, stream=True)
+        r.raise_for_status()
         file_size = int(r.headers['content-length'])
         chunk_size = 128 * 1000  # 1k for chunk_size, since Ethernet packet size is around 1500 bytes
         with open(tmp_checkpoint_fn, 'wb') as f:
@@ -39,11 +48,17 @@ def load_checkpoint(weights_url, checkpoint_fn):
         for k,v in metadata.items():
             if k != '__metadata__':
                 s, e = v['data_offsets']
-                state_dict[k] = torch.frombuffer(tensor_data[s:e], dtype=torch.float32).view(v['shape'])
+                state_dict[k] = torch.frombuffer(tensor_data[s:e], dtype=dtype).view(v['shape'])
         return state_dict
 
+def load_checkpoints(weights_urls, checkpoint_fns, dtype=torch.float32):
+    state_dict = {}
+    for weights_url, checkpoint_fns in zip(weights_urls, checkpoint_fns):
+        state_dict.update(load_checkpoint(weights_url, checkpoint_fns, dtype=dtype))
+    return state_dict
 
-def fix_state_dict(state_dict):
+
+def fix_gpt_state_dict(state_dict):
     replacements = {
         'h.': 'blocks.',
         'wte.': 'embed_tokens.',
@@ -58,11 +73,25 @@ def fix_state_dict(state_dict):
     linears = ['attn.qkv.weight', 'attn.proj.weight', 'mlp.fc1.weight', 'mlp.fc2.weight']
     biases = ['attn.bias', 'attn.masked_bias']
 
-    for src,dst in replacements.items():
+    for src, dst in replacements.items():
         state_dict = {k.replace(src, dst): v for k,v in state_dict.items()}
     state_dict = {k:v for k,v in state_dict.items() if not any(x in k for x in biases)}
     state_dict = {k: v.transpose(-1, -2) if any(x in k for x in linears) else v for k,v in state_dict.items()}
     state_dict['fc_out.weight'] = state_dict['embed_tokens.weight']
+    return state_dict
+
+def fix_llama_state_dict(state_dict):
+    replacements = {
+        'model.': '',
+        'layers.': 'blocks.',
+        'input_layernorm': 'ln1',
+        'post_attention_layernorm': 'ln2',
+        'self_attn.': 'attn.',
+        'mlp.': 'ff.',
+        'norm.': 'ln.',
+        'lm_head.': 'out_proj.'}
+    for src, dst in replacements.items():
+        state_dict = {k.replace(src, dst): v for k,v in state_dict.items()}
     return state_dict
 
 
@@ -78,16 +107,23 @@ if __name__ == '__main__':
     if args.file:
         with safetensors.safe_open(args.file, framework="pt", device="cpu") as f:
             state_dict = {k: f.get_tensor(k) for k in f.keys()}
-    else:
-        weights_url = f'https://huggingface.co/{args.model}/resolve/main/model.safetensors'
-        checkpoint_fn = f'/tmp/{args.model}.safetensors'
+    elif args.model.startswith('gpt2'):
+        checkpoint_fn = CHECKPOINT_DIR / f'{args.model}.safetensors'
+        weights_url = GPT2_URL.format(model=args.model)
         state_dict = load_checkpoint(weights_url, checkpoint_fn)
-        state_dict = fix_state_dict(state_dict)
+        state_dict = fix_gpt_state_dict(state_dict)
+    elif args.model.startswith('llama3'):
+        assert HUGGINGFACE_API_KEY, "HUGGINGFACE_API_KEY must be set to download llama models"
+        weights_urls = [LLAMA3_URL.format(size=args.model.removeprefix('llama3-'), index=i) for i in range(1, 5)]
+        checkpoint_fns = [CHECKPOINT_DIR / f'{args.model}-{i:05d}.safetensors' for i in range(len(weights_urls))]
+        state_dict = load_checkpoints(weights_urls, checkpoint_fns, dtype=torch.bfloat16)
+        state_dict = fix_llama_state_dict(state_dict)
 
     # Create the model
     device = torch.device('cpu')
     config = CONFIGS[args.model]
-    model = GPT(config).to(device).eval()
+    model = GPT(config) if isinstance(config, GPTConfig) else Llama(config)
+    model = model.to(device).eval()
     model.load_state_dict(state_dict)
     tokenizer = tiktoken.get_encoding("gpt2")
 
