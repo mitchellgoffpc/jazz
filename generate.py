@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 import os
-import json
-import struct
 import torch
 import argparse
 import requests
@@ -9,6 +7,7 @@ import tiktoken
 import safetensors
 from pathlib import Path
 from tqdm import tqdm, trange
+from tiktoken.load import load_tiktoken_bpe
 from models.gpt import GPT, GPTConfig
 from models.llama import Llama, LlamaConfig
 
@@ -16,6 +15,7 @@ CHECKPOINT_DIR = Path(__file__).parent / 'pretrained'
 HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
 GPT2_URL = "https://huggingface.co/{model}/resolve/main/model.safetensors"
 LLAMA3_URL = "https://huggingface.co/meta-llama/Meta-Llama-3-{size}/resolve/main/model-{index:05d}-of-00004.safetensors"
+LLAMA3_TOKENIZER_URL = 'https://huggingface.co/meta-llama/Meta-Llama-3-8B/resolve/main/original/tokenizer.model'
 
 CONFIGS = {
     'gpt2': GPTConfig(num_layers=12, num_heads=12, embed_size=768),
@@ -25,37 +25,60 @@ CONFIGS = {
     'llama3-8b': LlamaConfig(num_layers=32, num_heads=32, embed_size=4096)}
 
 
-def load_checkpoint(weights_url, checkpoint_fn, dtype=torch.float32):
-    tmp_checkpoint_fn = f'{checkpoint_fn}.tmp'
-    if not os.path.exists(checkpoint_fn):
+def load_file(url, output_fn):
+    tmp_output_fn = f'{output_fn}.tmp'
+    if not os.path.exists(output_fn):
         headers = {'Authorization': f'Bearer {HUGGINGFACE_API_KEY}'} if HUGGINGFACE_API_KEY else {}
-        r = requests.get(weights_url, headers=headers, stream=True)
+        r = requests.get(url, headers=headers, stream=True)
         r.raise_for_status()
         file_size = int(r.headers['content-length'])
-        chunk_size = 128 * 1000  # 1k for chunk_size, since Ethernet packet size is around 1500 bytes
-        with open(tmp_checkpoint_fn, 'wb') as f:
-            with tqdm(desc="Fetching " + weights_url, total=file_size, unit_scale=True) as pbar:
+        chunk_size = 128 * 1000
+        with open(tmp_output_fn, 'wb') as f:
+            with tqdm(desc="Fetching " + url, total=file_size, unit_scale=True) as pbar:
                 for chunk in r.iter_content(chunk_size=chunk_size):
                     f.write(chunk)
                     pbar.update(chunk_size)
-        os.rename(tmp_checkpoint_fn, checkpoint_fn)
+        os.rename(tmp_output_fn, output_fn)
 
-    with open(checkpoint_fn, 'rb') as f:
-        header_len, = struct.unpack('<Q', f.read(8))
-        metadata = json.loads(f.read(header_len))
-        tensor_data = bytearray(f.read()).copy()
-        state_dict = {}
-        for k,v in metadata.items():
-            if k != '__metadata__':
-                s, e = v['data_offsets']
-                state_dict[k] = torch.frombuffer(tensor_data[s:e], dtype=dtype).view(v['shape'])
-        return state_dict
+def load_checkpoint(weights_url, checkpoint_fn):
+    load_file(weights_url, checkpoint_fn)
+    with safetensors.safe_open(checkpoint_fn, framework='pt') as f:
+        return {k: f.get_tensor(k) for k in f.keys()}
 
-def load_checkpoints(weights_urls, checkpoint_fns, dtype=torch.float32):
+def load_checkpoints(weights_urls, checkpoint_fns):
     state_dict = {}
     for weights_url, checkpoint_fns in zip(weights_urls, checkpoint_fns):
-        state_dict.update(load_checkpoint(weights_url, checkpoint_fns, dtype=dtype))
+        state_dict.update(load_checkpoint(weights_url, checkpoint_fns))
     return state_dict
+
+def load_llama_tokenizer(model_url, model_fn):
+    load_file(model_url, model_fn)
+    mergeable_ranks = load_tiktoken_bpe(str(model_fn))
+    num_base_tokens = len(mergeable_ranks)
+    num_reserved_special_tokens = 256
+    pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+    special_tokens = [
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<|reserved_special_token_0|>",
+        "<|reserved_special_token_1|>",
+        "<|reserved_special_token_2|>",
+        "<|reserved_special_token_3|>",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "<|reserved_special_token_4|>",
+        "<|eot_id|>",  # end of turn
+    ] + [
+        f"<|reserved_special_token_{i}|>"
+        for i in range(5, num_reserved_special_tokens - 5)
+    ]
+    special_tokens = {token: num_base_tokens + i for i, token in enumerate(special_tokens)}
+    return tiktoken.Encoding(
+        name=model_fn.name,
+        pat_str=pat_str,
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=special_tokens,
+    )
 
 
 def fix_gpt_state_dict(state_dict):
@@ -103,6 +126,9 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--prompt', help='Prompt to generate completion for')
     args = parser.parse_args()
 
+    config = CONFIGS[args.model]
+    device = torch.device('cpu')
+
     # Load the checkpoint
     if args.file:
         with safetensors.safe_open(args.file, framework="pt", device="cpu") as f:
@@ -116,16 +142,19 @@ if __name__ == '__main__':
         assert HUGGINGFACE_API_KEY, "HUGGINGFACE_API_KEY must be set to download llama models"
         weights_urls = [LLAMA3_URL.format(size=args.model.removeprefix('llama3-'), index=i) for i in range(1, 5)]
         checkpoint_fns = [CHECKPOINT_DIR / f'{args.model}-{i:05d}.safetensors' for i in range(len(weights_urls))]
-        state_dict = load_checkpoints(weights_urls, checkpoint_fns, dtype=torch.bfloat16)
+        state_dict = load_checkpoints(weights_urls, checkpoint_fns)
         state_dict = fix_llama_state_dict(state_dict)
 
     # Create the model
-    device = torch.device('cpu')
-    config = CONFIGS[args.model]
-    model = GPT(config) if isinstance(config, GPTConfig) else Llama(config)
-    model = model.to(device).eval()
+    if isinstance(config, GPTConfig):
+        tokenizer = tiktoken.get_encoding("gpt2")
+        model = GPT(config)
+    else:
+        tokenizer = load_llama_tokenizer(LLAMA3_TOKENIZER_URL, CHECKPOINT_DIR / 'llama-tokenizer.model')
+        model = Llama(config)
+
     model.load_state_dict(state_dict)
-    tokenizer = tiktoken.get_encoding("gpt2")
+    model = model.to(device).eval()
 
     # Benchmark
     if args.benchmark:
@@ -136,8 +165,10 @@ if __name__ == '__main__':
 
     # Decode
     else:
-        prompt = args.prompt or "From fairest creatures"
-        context = torch.tensor(tokenizer.encode(prompt))[None].to(device)
-        result = model.generate(context, num_tokens=50, top_k=10)
+        prompt = args.prompt or "The capital of France is"
+        tokens = tokenizer.encode(prompt)
+        tokens = [tokenizer._special_tokens['<|begin_of_text|>'], *tokens]
+        context = torch.tensor(tokens)[None].to(device)
+        result = model.generate(context, num_tokens=3, top_k=10)
         print(f"Prompt:    ", prompt)
         print(f"Completion:", tokenizer.decode(result[0].tolist()))

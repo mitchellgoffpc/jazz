@@ -11,14 +11,13 @@ class LlamaConfig:
     embed_size: int = 4096
     intermediate_size: int = 14336
     vocab_size: int = 128256
-    context_size: int = 2048
+    context_size: int = 8192
     dropout: float = 0.0
-    attention_dropout: float = 0.0
-    rms_norm_eps: float = 1e-6
+    rms_norm_eps: float = 1e-5
     bias: bool = False
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
@@ -26,7 +25,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 
 def apply_rotary_emb(x, freqs_cis):
     x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(x_complex * freqs_cis).flatten(3)
+    return torch.view_as_real(x_complex * freqs_cis[None, None]).flatten(start_dim=3)
 
 
 class RMSNorm(nn.Module):
@@ -54,13 +53,13 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(self.embed_size, self.num_kv_heads * self.head_dim, bias=config.bias)
         self.v_proj = nn.Linear(self.embed_size, self.num_kv_heads * self.head_dim, bias=config.bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_size, bias=config.bias)
-        self.dropout = nn.Dropout(config.attention_dropout)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x, freqs_cis, past, past_len):
         B, T, C = x.shape
-        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(B, T, self.num_kv_heads, self.head_dim)
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
@@ -70,16 +69,14 @@ class Attention(nn.Module):
             past[:, :, 0, past_len:past_len+T], past[:, :, 1, past_len:past_len+T] = k, v
             k, v = past[:, :, 0, :past_len+T], past[:, :, 1, :past_len+T]
 
-        k = k.repeat_interleave(self.num_kv_groups, dim=2)
-        v = v.repeat_interleave(self.num_kv_groups, dim=2)
+        k = k.repeat_interleave(self.num_kv_groups, dim=1)
+        v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
-        attn = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-            attn_mask=None, is_causal=T > 1, dropout_p=self.config.attention_dropout if self.training else 0
-        )
-
-        attn = attn.transpose(1, 2).contiguous().view(B, T, C)
-        return self.dropout(self.o_proj(attn))
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=T > 1, dropout_p=self.config.dropout if self.training else 0)
+        x = x.transpose(1, 2).contiguous().view(B, T, C)
+        x = self.o_proj(x)
+        x = self.dropout(x)
+        return x
 
 class FeedForward(nn.Module):
     def __init__(self, config: LlamaConfig):
