@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 import os
+import time
+import types
 import torch
 import argparse
 import requests
@@ -73,12 +75,15 @@ def load_llama_tokenizer(model_url, model_fn):
         for i in range(5, num_reserved_special_tokens - 5)
     ]
     special_tokens = {token: num_base_tokens + i for i, token in enumerate(special_tokens)}
-    return tiktoken.Encoding(
+    tokenizer = tiktoken.Encoding(
         name=model_fn.name,
         pat_str=pat_str,
         mergeable_ranks=mergeable_ranks,
         special_tokens=special_tokens,
     )
+    def encode(text: str): return [tokenizer._special_tokens['<|begin_of_text|>'], *tokenizer.encode(text)]
+    def decode(tokens: str): return tokenizer.decode(tokens[1:])  # remove begin_of_text token
+    return types.SimpleNamespace(encode=encode, decode=decode)
 
 
 def fix_gpt_state_dict(state_dict):
@@ -110,6 +115,7 @@ def fix_llama_state_dict(state_dict):
         'input_layernorm': 'ln1',
         'post_attention_layernorm': 'ln2',
         'self_attn.': 'attn.',
+        'attn.o_proj.': 'attn.out_proj.',
         'mlp.': 'ff.',
         'norm.': 'ln.',
         'lm_head.': 'out_proj.'}
@@ -126,8 +132,9 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--prompt', help='Prompt to generate completion for')
     args = parser.parse_args()
 
+    st = time.time()
     config = CONFIGS[args.model]
-    device = torch.device('cpu')
+    device = torch.device('cuda')
 
     # Load the checkpoint
     if args.file:
@@ -148,13 +155,15 @@ if __name__ == '__main__':
     # Create the model
     if isinstance(config, GPTConfig):
         tokenizer = tiktoken.get_encoding("gpt2")
-        model = GPT(config)
+        model = GPT(config).to(device)
     else:
+        torch.set_default_dtype(torch.bfloat16)
+        torch.set_default_device(device)
         tokenizer = load_llama_tokenizer(LLAMA3_TOKENIZER_URL, CHECKPOINT_DIR / 'llama-tokenizer.model')
         model = Llama(config)
 
-    model.load_state_dict(state_dict)
-    model = model.to(device).eval()
+    model.eval().load_state_dict(state_dict)
+    print(f"Loaded model in {time.time() - st:.2f}s")
 
     # Benchmark
     if args.benchmark:
@@ -165,9 +174,8 @@ if __name__ == '__main__':
 
     # Decode
     else:
-        prompt = args.prompt or "The capital of France is"
+        prompt = args.prompt or "The capital of Germany is Berlin. The capital of France is"
         tokens = tokenizer.encode(prompt)
-        tokens = [tokenizer._special_tokens['<|begin_of_text|>'], *tokens]
         context = torch.tensor(tokens)[None].to(device)
         result = model.generate(context, num_tokens=3, top_k=10)
         print(f"Prompt:    ", prompt)

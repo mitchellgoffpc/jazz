@@ -19,25 +19,26 @@ class LlamaConfig:
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
     return torch.polar(torch.ones_like(freqs), freqs)
 
 def apply_rotary_emb(x, freqs_cis):
     x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(x_complex * freqs_cis[None, None]).flatten(start_dim=3)
+    return torch.view_as_real(x_complex * freqs_cis[None, None]).flatten(start_dim=3).type_as(x)
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        norm = x.norm(2, dim=-1, keepdim=True)
-        x_normed = x / (norm + self.eps)
-        return self.weight * x_normed
+        x = x.float().type_as(x)
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * self.weight
+
 
 class Attention(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -52,7 +53,7 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(self.embed_size, self.num_heads * self.head_dim, bias=config.bias)
         self.k_proj = nn.Linear(self.embed_size, self.num_kv_heads * self.head_dim, bias=config.bias)
         self.v_proj = nn.Linear(self.embed_size, self.num_kv_heads * self.head_dim, bias=config.bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_size, bias=config.bias)
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_size, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x, freqs_cis, past, past_len):
@@ -74,7 +75,7 @@ class Attention(nn.Module):
 
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=T > 1, dropout_p=self.config.dropout if self.training else 0)
         x = x.transpose(1, 2).contiguous().view(B, T, C)
-        x = self.o_proj(x)
+        x = self.out_proj(x)
         x = self.dropout(x)
         return x
 
@@ -110,11 +111,7 @@ class Llama(nn.Module):
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
         self.ln = RMSNorm(config.embed_size, eps=config.rms_norm_eps)
         self.out_proj = nn.Linear(config.embed_size, config.vocab_size, bias=False)
-
-        self.freqs_cis = precompute_freqs_cis(
-            self.config.embed_size // self.config.num_heads,
-            self.config.context_size * 2
-        )
+        self.freqs_cis = precompute_freqs_cis(self.config.embed_size // self.config.num_heads, self.config.context_size * 2)
 
     def forward(self, x, past=None, past_len=0):
         assert past is None or past_len < past.shape[4]
