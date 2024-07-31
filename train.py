@@ -6,7 +6,7 @@ import shutil
 import datetime
 from tqdm import tqdm
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field
 from safetensors.torch import save_file
@@ -20,9 +20,12 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from models.gpt import GPTConfig, GPT
+from models.llama import LlamaConfig, Llama
 from datasets.text import TextDataset
 
 OPTIMIZERS = {'Adam': torch.optim.Adam, 'AdamW': torch.optim.AdamW}
+CONFIG_TYPES = {'gpt2': GPTConfig, 'llama': LlamaConfig}
+MODEL_TYPES = {'gpt2': GPT, 'llama': Llama}
 
 @dataclass
 class Config:
@@ -31,7 +34,8 @@ class Config:
     learning_rate: float = 3e-4
     val_split: float = 0.1
     optim: str = 'Adam'
-    model: GPTConfig = field(default_factory=GPTConfig)
+    type: str = 'gpt2'
+    model: Any = field(default_factory=dict)
 
     data_path: str = '/raid.unprotected/datasets/shakespeare'
     checkpoint_path: Optional[str] = None
@@ -47,7 +51,7 @@ def get_dataloader(config, rank, train=True):
     split_idx = int(len(indices) * (1 - config.val_split))
     subset_indices = indices[:split_idx] if train else indices[split_idx:]
     subset = Subset(dataset, subset_indices)
-    sampler = DistributedSampler(subset)
+    sampler = DistributedSampler(subset, rank=rank)
     return DataLoader(subset, batch_size=config.batch_size, num_workers=4, pin_memory=True, sampler=sampler)
 
 def all_reduce(data, device):
@@ -60,7 +64,8 @@ def train(rank, world_size, config, result_path):
 
     # Instantiate the model
     device = torch.device(f'cuda:{rank}')
-    model = GPT(config.model).to(device)
+    config.model = CONFIG_TYPES[config.type](**config.model)
+    model = MODEL_TYPES[config.type](config.model).to(device)
     model = DDP(model, device_ids=[rank])
     optimizer = OPTIMIZERS[config.optim](model.parameters(), lr=config.learning_rate)
     if config.checkpoint_path:

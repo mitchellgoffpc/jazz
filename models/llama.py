@@ -111,7 +111,7 @@ class Llama(nn.Module):
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
         self.ln = RMSNorm(config.embed_size, eps=config.rms_norm_eps)
         self.out_proj = nn.Linear(config.embed_size, config.vocab_size, bias=False)
-        self.freqs_cis = precompute_freqs_cis(self.config.embed_size // self.config.num_heads, self.config.context_size * 2)
+        self.register_buffer('freqs_cis', precompute_freqs_cis(self.config.embed_size // self.config.num_heads, self.config.context_size * 2), persistent=False)
 
     def forward(self, x, past=None, past_len=0):
         assert past is None or past_len < past.shape[4]
