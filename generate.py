@@ -10,8 +10,7 @@ import safetensors
 from pathlib import Path
 from tqdm import tqdm, trange
 from tiktoken.load import load_tiktoken_bpe
-from models.gpt import GPT, GPTConfig
-from models.llama import Llama, LlamaConfig
+from models.gpt import GPT, GPTConfig, LlamaConfig
 
 CHECKPOINT_DIR = Path(__file__).parent / 'pretrained'
 HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
@@ -92,20 +91,25 @@ def fix_gpt_state_dict(state_dict):
         'wte.': 'embed_tokens.',
         'wpe.': 'embed_pos.',
         'attn.c_attn': 'attn.qkv',
-        'attn.c_proj': 'attn.proj',
-        'mlp.c_fc': 'mlp.fc1',
-        'mlp.c_proj': 'mlp.fc2',
+        'attn.c_proj': 'attn.out',
+        'mlp.c_fc': 'mlp.up',
+        'mlp.c_proj': 'mlp.down',
         'ln_1.': 'ln1.',
         'ln_2.': 'ln2.',
         'ln_f.': 'ln.'}
-    linears = ['attn.qkv.weight', 'attn.proj.weight', 'mlp.fc1.weight', 'mlp.fc2.weight']
+    linears = ['attn.qkv.weight', 'attn.out.weight', 'mlp.up.weight', 'mlp.down.weight']
     biases = ['attn.bias', 'attn.masked_bias']
 
     for src, dst in replacements.items():
         state_dict = {k.replace(src, dst): v for k,v in state_dict.items()}
     state_dict = {k:v for k,v in state_dict.items() if not any(x in k for x in biases)}
     state_dict = {k: v.transpose(-1, -2) if any(x in k for x in linears) else v for k,v in state_dict.items()}
-    state_dict['fc_out.weight'] = state_dict['embed_tokens.weight']
+    state_dict['out.weight'] = state_dict['embed_tokens.weight']
+    for key in list(state_dict.keys()):
+        if '.qkv.' in key:
+            value = state_dict.pop(key)
+            q, k, v = (key.replace('.qkv.', f'.{x}.') for x in 'qkv')
+            state_dict[q], state_dict[k], state_dict[v] = value.view(3, value.shape[0] // 3, *value.shape[1:]).unbind(dim=0)
     return state_dict
 
 def fix_llama_state_dict(state_dict):
@@ -115,13 +119,29 @@ def fix_llama_state_dict(state_dict):
         'input_layernorm': 'ln1',
         'post_attention_layernorm': 'ln2',
         'self_attn.': 'attn.',
-        'attn.o_proj.': 'attn.out_proj.',
-        'mlp.': 'ff.',
+        'attn.o_proj.': 'attn.out.',
+        # 'mlp.': 'ff.',
         'norm.': 'ln.',
-        'lm_head.': 'out_proj.'}
+        'lm_head.': 'out.',
+        '_proj.': '.'}
     for src, dst in replacements.items():
         state_dict = {k.replace(src, dst): v for k,v in state_dict.items()}
     return state_dict
+
+# def fix_llama_state_dict(state_dict):
+#     replacements = {
+#         'model.': '',
+#         'layers.': 'blocks.',
+#         'input_layernorm': 'ln1',
+#         'post_attention_layernorm': 'ln2',
+#         'self_attn.': 'attn.',
+#         'attn.o_proj.': 'attn.out_proj.',
+#         'mlp.': 'ff.',
+#         'norm.': 'ln.',
+#         'lm_head.': 'out_proj.'}
+#     for src, dst in replacements.items():
+#         state_dict = {k.replace(src, dst): v for k,v in state_dict.items()}
+#     return state_dict
 
 
 if __name__ == '__main__':
@@ -153,14 +173,14 @@ if __name__ == '__main__':
         state_dict = fix_llama_state_dict(state_dict)
 
     # Create the model
-    if isinstance(config, GPTConfig):
-        tokenizer = tiktoken.get_encoding("gpt2")
-        model = GPT(config).to(device)
-    else:
+    if isinstance(config, LlamaConfig):
         torch.set_default_dtype(torch.bfloat16)
         torch.set_default_device(device)
         tokenizer = load_llama_tokenizer(LLAMA3_TOKENIZER_URL, CHECKPOINT_DIR / 'llama-tokenizer.model')
-        model = Llama(config)
+        model = GPT(config)
+    else:
+        tokenizer = tiktoken.get_encoding("gpt2")
+        model = GPT(config).to(device)
 
     model.eval().load_state_dict(state_dict)
     print(f"Loaded model in {time.time() - st:.2f}s")
