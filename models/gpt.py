@@ -2,17 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional
 
 @dataclass
 class GPTConfig:
     num_layers: int = 12
     num_heads: int = 12
-    num_kv_heads: Optional[int] = None
+    num_kv_heads: int | None = None
     embed_size: int = 768
     vocab_size: int = 50257
     context_size: int = 1024
     expansion_ratio: float = 4
+    norm_eps: float = 1e-5
     dropout: float = 0.0
     bias: bool = True
     tie_weights: bool = False
@@ -29,7 +29,6 @@ class LlamaConfig(GPTConfig):
     expansion_ratio: float = 3.5
     vocab_size: int = 128256
     context_size: int = 8192
-    rms_norm_eps: float = 1e-5
     bias: bool = False
     rms_norm: bool = True
     gated_mlp: bool = True
@@ -123,8 +122,8 @@ class Block(nn.Module):
         super().__init__()
         self.attn = Attention(config)
         self.mlp = MLP(config)
-        self.ln1 = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm)
-        self.ln2 = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm)
+        self.ln1 = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm, eps=config.norm_eps)
+        self.ln2 = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm, eps=config.norm_eps)
 
     def forward(self, x, past, past_len, freqs_cis=None):
         x = x + self.attn(self.ln1(x), past, past_len, freqs_cis)
@@ -144,7 +143,7 @@ class GPT(nn.Module):
 
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
         self.dropout = nn.Dropout(config.dropout)
-        self.ln = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm)
+        self.ln = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm, eps=config.norm_eps)
         self.out = nn.Linear(config.embed_size, config.vocab_size, bias=False)
         if config.tie_weights:
             self.out.weight = self.embed_tokens.weight
