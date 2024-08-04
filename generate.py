@@ -92,12 +92,12 @@ def fix_gpt_state_dict(state_dict):
         'wpe.': 'embed_pos.',
         'attn.c_attn': 'attn.qkv',
         'attn.c_proj': 'attn.out',
-        'mlp.c_fc': 'mlp.up',
-        'mlp.c_proj': 'mlp.down',
+        'mlp.c_fc': 'ff.up',
+        'mlp.c_proj': 'ff.down',
         'ln_1.': 'ln1.',
         'ln_2.': 'ln2.',
         'ln_f.': 'ln.'}
-    linears = ['attn.qkv.weight', 'attn.out.weight', 'mlp.up.weight', 'mlp.down.weight']
+    linears = ['attn.qkv.weight', 'attn.out.weight', 'ff.up.weight', 'ff.down.weight']
     biases = ['attn.bias', 'attn.masked_bias']
 
     for src, dst in replacements.items():
@@ -120,28 +120,13 @@ def fix_llama_state_dict(state_dict):
         'post_attention_layernorm': 'ln2',
         'self_attn.': 'attn.',
         'attn.o_proj.': 'attn.out.',
-        # 'mlp.': 'ff.',
+        'mlp.': 'ff.',
         'norm.': 'ln.',
         'lm_head.': 'out.',
         '_proj.': '.'}
     for src, dst in replacements.items():
         state_dict = {k.replace(src, dst): v for k,v in state_dict.items()}
     return state_dict
-
-# def fix_llama_state_dict(state_dict):
-#     replacements = {
-#         'model.': '',
-#         'layers.': 'blocks.',
-#         'input_layernorm': 'ln1',
-#         'post_attention_layernorm': 'ln2',
-#         'self_attn.': 'attn.',
-#         'attn.o_proj.': 'attn.out_proj.',
-#         'mlp.': 'ff.',
-#         'norm.': 'ln.',
-#         'lm_head.': 'out_proj.'}
-#     for src, dst in replacements.items():
-#         state_dict = {k.replace(src, dst): v for k,v in state_dict.items()}
-#     return state_dict
 
 
 if __name__ == '__main__':

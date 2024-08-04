@@ -14,11 +14,11 @@ class GPTConfig:
     expansion_ratio: float = 4
     norm_eps: float = 1e-5
     dropout: float = 0.0
-    bias: bool = True
+    use_bias: bool = True
     tie_weights: bool = False
-    rms_norm: bool = False
-    gated_mlp: bool = False
-    rotary_embeddings: bool = False
+    use_rms_norm: bool = False
+    use_gated_mlp: bool = False
+    use_rotary_embeddings: bool = False
 
 @dataclass
 class LlamaConfig(GPTConfig):
@@ -26,13 +26,13 @@ class LlamaConfig(GPTConfig):
     num_heads: int = 32
     num_kv_heads: int = 8
     embed_size: int = 4096
-    expansion_ratio: float = 3.5
     vocab_size: int = 128256
     context_size: int = 8192
-    bias: bool = False
-    rms_norm: bool = True
-    gated_mlp: bool = True
-    rotary_embeddings: bool = True
+    expansion_ratio: float = 3.5
+    use_bias: bool = False
+    use_rms_norm: bool = True
+    use_gated_mlp: bool = True
+    use_rotary_embeddings: bool = True
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
@@ -47,15 +47,15 @@ def apply_rotary_emb(x, freqs_cis):
 
 
 class LayerNorm(nn.Module):
-    def __init__(self, n: int, bias: bool, rms_norm: bool, eps: float = 1e-5):
+    def __init__(self, n: int, use_bias: bool, use_rms_norm: bool, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
-        self.rms_norm = rms_norm
+        self.use_rms_norm = use_rms_norm
         self.weight = nn.Parameter(torch.ones(n))
-        self.bias = nn.Parameter(torch.zeros(n)) if bias else None
+        self.bias = nn.Parameter(torch.zeros(n)) if use_bias else None
 
     def forward(self, x):
-        if self.rms_norm:
+        if self.use_rms_norm:
             x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
             return x * self.weight + (self.bias if self.bias is not None else 0)
         else:
@@ -70,10 +70,10 @@ class Attention(nn.Module):
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.head_dim = config.embed_size // self.num_heads
 
-        self.q = nn.Linear(config.embed_size, self.num_heads * self.head_dim, bias=config.bias)
-        self.k = nn.Linear(config.embed_size, self.num_kv_heads * self.head_dim, bias=config.bias)
-        self.v = nn.Linear(config.embed_size, self.num_kv_heads * self.head_dim, bias=config.bias)
-        self.out = nn.Linear(config.embed_size, config.embed_size, bias=config.bias)
+        self.q = nn.Linear(config.embed_size, self.num_heads * self.head_dim, bias=config.use_bias)
+        self.k = nn.Linear(config.embed_size, self.num_kv_heads * self.head_dim, bias=config.use_bias)
+        self.v = nn.Linear(config.embed_size, self.num_kv_heads * self.head_dim, bias=config.use_bias)
+        self.out = nn.Linear(config.embed_size, config.embed_size, bias=config.use_bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x, past, past_len, freqs_cis=None):
@@ -82,7 +82,7 @@ class Attention(nn.Module):
         k = self.k(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        if self.config.rotary_embeddings:
+        if self.config.use_rotary_embeddings:
             q = apply_rotary_emb(q, freqs_cis)
             k = apply_rotary_emb(k, freqs_cis)
 
@@ -100,12 +100,12 @@ class Attention(nn.Module):
         x = self.dropout(x)
         return x
 
-class MLP(nn.Module):
+class FeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.gate = nn.Linear(config.embed_size, int(config.embed_size * config.expansion_ratio), bias=config.bias) if config.gated_mlp else None
-        self.up = nn.Linear(config.embed_size, int(config.embed_size * config.expansion_ratio), bias=config.bias)
-        self.down = nn.Linear(int(config.embed_size * config.expansion_ratio), config.embed_size, bias=config.bias)
+        self.gate = nn.Linear(config.embed_size, int(config.embed_size * config.expansion_ratio), bias=config.use_bias) if config.use_gated_mlp else None
+        self.up = nn.Linear(config.embed_size, int(config.embed_size * config.expansion_ratio), bias=config.use_bias)
+        self.down = nn.Linear(int(config.embed_size * config.expansion_ratio), config.embed_size, bias=config.use_bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -121,13 +121,13 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = Attention(config)
-        self.mlp = MLP(config)
-        self.ln1 = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm, eps=config.norm_eps)
-        self.ln2 = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm, eps=config.norm_eps)
+        self.ff = FeedForward(config)
+        self.ln1 = LayerNorm(config.embed_size, use_bias=config.use_bias, use_rms_norm=config.use_rms_norm, eps=config.norm_eps)
+        self.ln2 = LayerNorm(config.embed_size, use_bias=config.use_bias, use_rms_norm=config.use_rms_norm, eps=config.norm_eps)
 
     def forward(self, x, past, past_len, freqs_cis=None):
         x = x + self.attn(self.ln1(x), past, past_len, freqs_cis)
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.ff(self.ln2(x))
         return x
 
 
@@ -136,14 +136,14 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.embed_size)
-        if config.rotary_embeddings:
+        if config.use_rotary_embeddings:
             self.register_buffer('freqs_cis', precompute_freqs_cis(self.config.embed_size // self.config.num_heads, self.config.context_size * 2), persistent=False)
         else:
             self.embed_pos = nn.Embedding(config.context_size, config.embed_size)
 
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
         self.dropout = nn.Dropout(config.dropout)
-        self.ln = LayerNorm(config.embed_size, bias=config.bias, rms_norm=config.rms_norm, eps=config.norm_eps)
+        self.ln = LayerNorm(config.embed_size, use_bias=config.use_bias, use_rms_norm=config.use_rms_norm, eps=config.norm_eps)
         self.out = nn.Linear(config.embed_size, config.vocab_size, bias=False)
         if config.tie_weights:
             self.out.weight = self.embed_tokens.weight
@@ -151,7 +151,7 @@ class GPT(nn.Module):
     def forward(self, x, past=None, past_len=0):
         assert past is None or past_len < past.shape[4]
         _, T = x.shape
-        if self.config.rotary_embeddings:
+        if self.config.use_rotary_embeddings:
             x = self.embed_tokens(x)
             freqs_cis = self.freqs_cis[past_len:past_len + T]
         else:
