@@ -4,8 +4,10 @@ import csv
 import time
 import shutil
 import datetime
+import tiktoken
 from tqdm import tqdm
 from pathlib import Path
+from typing import Optional
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field, replace
 from safetensors.torch import save_file
@@ -31,15 +33,15 @@ class Config:
     val_split: float = 0.1
     optim: str = 'Adam'
     model: GPTConfig = field(default_factory=GPTConfig)
-
     data_path: str = '/raid.unprotected/datasets/shakespeare'
-    checkpoint_path: str | None = None
+    tokenizer: Optional[str] = None
+    checkpoint_path: Optional[str] = None
     save: bool = True
     save_every: int = 1
 
 
-def get_dataloader(config, rank, train=True):
-    dataset = TextDataset(config.data_path, config.model.context_size + 1)
+def get_dataloader(config, rank, tokenizer, train=True):
+    dataset = TextDataset(config.data_path, config.model.context_size + 1, tokenizer)
     num_samples = len(dataset) // (config.model.context_size + 1)
     indices = torch.randperm(len(dataset))[:num_samples]
 
@@ -57,6 +59,15 @@ def all_reduce(data, device):
 def train(rank, world_size, config, result_path):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
+    # Load the dataset
+    tokenizer = None
+    if config.tokenizer == 'gpt2':
+        tokenizer = tiktoken.get_encoding("gpt2")
+    config.model.vocab_size = tokenizer.n_vocab if tokenizer else 256
+
+    train_loader = get_dataloader(config, rank, tokenizer, train=True)
+    val_loader = get_dataloader(config, rank, tokenizer, train=False)
+
     # Instantiate the model
     device = torch.device(f'cuda:{rank}')
     model = GPT(config.model).to(device)
@@ -67,10 +78,6 @@ def train(rank, world_size, config, result_path):
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {total_params:,}")
-
-    # Load the dataset
-    train_loader = get_dataloader(config, rank, train=True)
-    val_loader = get_dataloader(config, rank, train=False)
 
     # Create results directory and csv file
     save_experiment = config.save and rank == 0

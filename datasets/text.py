@@ -1,4 +1,3 @@
-import tiktoken
 import numpy as np
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -74,7 +73,7 @@ class TextDataset(Dataset):
 
 
 if __name__ == "__main__":
-    import sys, random, time, argparse
+    import sys, random, time, argparse, tiktoken
     from tqdm import tqdm
 
     parser = argparse.ArgumentParser(description="Text Dataset Utility")
