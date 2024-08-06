@@ -6,7 +6,6 @@ import shutil
 import datetime
 from tqdm import tqdm
 from pathlib import Path
-from typing import Optional, Any
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field, replace
 from safetensors.torch import save_file
@@ -19,20 +18,10 @@ from torch.utils.data import Subset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from models.gpt import GPT, GPTConfig
-from models.llama import Llama, LlamaConfig
+from models.gpt import GPT, GPTConfig, LlamaConfig
 from datasets.text import TextDataset
 
 OPTIMIZERS = {'Adam': torch.optim.Adam, 'AdamW': torch.optim.AdamW}
-MODEL_TYPES = {GPTConfig: GPT, LlamaConfig: Llama}
-CONFIGS = {
-    'gpt2': GPTConfig(num_layers=12, num_heads=12, embed_size=768),
-    'gpt2-medium': GPTConfig(num_layers=24, num_heads=16, embed_size=1024),
-    'gpt2-large': GPTConfig(num_layers=36, num_heads=20, embed_size=1280),
-    'gpt2-xl': GPTConfig(num_layers=48, num_heads=25, embed_size=1600),
-    'llama-160m': LlamaConfig(num_layers=12, num_heads=12, num_kv_heads=12, embed_size=768, intermediate_size=2048, context_size=1024),
-    'llama-400m': LlamaConfig(num_layers=24, num_heads=16, num_kv_heads=16, embed_size=1024, intermediate_size=2816, context_size=1024),
-    'llama3-8b': LlamaConfig(num_layers=32, num_heads=32, embed_size=4096)}
 
 @dataclass
 class Config:
@@ -41,11 +30,10 @@ class Config:
     learning_rate: float = 3e-4
     val_split: float = 0.1
     optim: str = 'Adam'
-    type: str = 'gpt2'
-    model: Any = field(default_factory=dict)
+    model: GPTConfig = field(default_factory=GPTConfig)
 
     data_path: str = '/raid.unprotected/datasets/shakespeare'
-    checkpoint_path: Optional[str] = None
+    checkpoint_path: str | None = None
     save: bool = True
     save_every: int = 1
 
@@ -71,8 +59,7 @@ def train(rank, world_size, config, result_path):
 
     # Instantiate the model
     device = torch.device(f'cuda:{rank}')
-    config.model = replace(CONFIGS[config.type], **config.model)
-    model = MODEL_TYPES[type(config.model)](config.model).to(device)
+    model = GPT(config.model).to(device)
     model = DDP(model, device_ids=[rank])
     optimizer = OPTIMIZERS[config.optim](model.parameters(), lr=config.learning_rate)
     if config.checkpoint_path:
