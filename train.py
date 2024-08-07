@@ -24,6 +24,7 @@ from models.gpt import GPT, GPTConfig, LlamaConfig
 from datasets.text import TextDataset
 
 OPTIMIZERS = {'Adam': torch.optim.Adam, 'AdamW': torch.optim.AdamW}
+DTYPES = {'f32': torch.float32, 'f16': torch.float16, 'bf16': torch.bfloat16}
 
 @dataclass
 class Config:
@@ -38,6 +39,8 @@ class Config:
     checkpoint_path: Optional[str] = None
     save: bool = True
     save_every: int = 1
+    dtype: str = 'f32'
+    compile: bool = False
 
 
 def get_dataloader(config, rank, tokenizer, train=True):
@@ -68,10 +71,17 @@ def train(rank, world_size, config, result_path):
     train_loader = get_dataloader(config, rank, tokenizer, train=True)
     val_loader = get_dataloader(config, rank, tokenizer, train=False)
 
-    # Instantiate the model
+    # Instantiate the model and optimizer
     device = torch.device(f'cuda:{rank}')
     model = GPT(config.model).to(device)
+    if config.compile:
+        torch.set_float32_matmul_precision('high')
+        model = torch.compile(model)
     model = DDP(model, device_ids=[rank])
+
+    dtype = DTYPES[config.dtype]
+    use_amp = dtype is not torch.float32
+    scaler = torch.amp.GradScaler() if use_amp else None
     optimizer = OPTIMIZERS[config.optim](model.parameters(), lr=config.learning_rate)
     if config.checkpoint_path:
         model.load_state_dict(torch.load(config.checkpoint_path))
@@ -104,10 +114,17 @@ def train(rank, world_size, config, result_path):
             tokens = tokens.to(device)
 
             optimizer.zero_grad()
-            outputs = model(tokens[:, :-1])
-            loss = F.cross_entropy(outputs.flatten(end_dim=1), tokens[:, 1:].flatten())
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast(enabled=use_amp, dtype=dtype, device_type=device.type):
+                outputs = model(tokens[:, :-1])
+                loss = F.cross_entropy(outputs.flatten(end_dim=1), tokens[:, 1:].flatten())
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             train_loss += loss.item()
             step_time = (time.time() - start_time) * 1000
@@ -118,14 +135,14 @@ def train(rank, world_size, config, result_path):
         with torch.no_grad():
             for tokens in (pbar := tqdm(val_loader, leave=False, disable=rank>0)):
                 tokens = tokens.to(device)
-                outputs = model(tokens[:, :-1])
-                loss = F.cross_entropy(outputs.flatten(end_dim=1), tokens[:, 1:].flatten())
+                with torch.amp.autocast(enabled=use_amp, dtype=dtype, device_type=device.type):
+                    outputs = model(tokens[:, :-1])
+                    loss = F.cross_entropy(outputs.flatten(end_dim=1), tokens[:, 1:].flatten())
                 val_loss += loss.item()
                 pbar.set_description(f"Epoch {epoch} | Val Loss: {loss.item():.4f}")
 
         # Print report and write results to CSV file
         train_loss, val_loss = (all_reduce(x, device) for x in (train_loss, val_loss))
-
         train_loss = train_loss / (len(train_loader) * world_size)
         val_loss = val_loss / (len(val_loader) * world_size)
         epoch_duration = int(time.time() - epoch_start_time)

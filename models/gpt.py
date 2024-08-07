@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,9 +36,17 @@ class LlamaConfig(GPTConfig):
     use_rotary_embeddings: bool = True
 
 
+def init_weights(module):
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    freqs = 1.0 / (theta ** (torch.arange(0, dim - 1, 2, dtype=torch.float32) / dim))
+    t = torch.arange(end, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
     return torch.polar(torch.ones_like(freqs), freqs)
 
@@ -137,7 +146,7 @@ class GPT(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.embed_size)
         if config.use_rotary_embeddings:
-            self.register_buffer('freqs_cis', precompute_freqs_cis(self.config.embed_size // self.config.num_heads, self.config.context_size * 2), persistent=False)
+            self.register_buffer('freqs_cis', precompute_freqs_cis(self.config.embed_size // self.config.num_heads, self.config.context_size), persistent=False)
         else:
             self.embed_pos = nn.Embedding(config.context_size, config.embed_size)
 
@@ -146,7 +155,12 @@ class GPT(nn.Module):
         self.ln = LayerNorm(config.embed_size, use_bias=config.use_bias, use_rms_norm=config.use_rms_norm, eps=config.norm_eps)
         self.out = nn.Linear(config.embed_size, config.vocab_size, bias=False)
         if config.tie_weights:
-            self.out.weight = self.embed_tokens.weight
+            self.embed_tokens.weight = self.out.weight
+
+        self.apply(init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith('down.weight'):
+                nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.num_layers))
 
     def forward(self, x, past=None, past_len=0):
         assert past is None or past_len < past.shape[4]
