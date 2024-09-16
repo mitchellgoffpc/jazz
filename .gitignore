@@ -1,2 +1,11 @@
-experiments/
-pretrained/
+# python
+__pycache__
+
+# outputs
+experiments
+pretrained
+data/hellaswag
+data/edu_fineweb10B
+data/edu_fineweb100B
+data/fineweb10B
+data/fineweb100B

@@ -38,7 +38,7 @@ class LlamaConfig(GPTConfig):
 
 def init_weights(module):
     if isinstance(module, nn.Linear):
-        nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        nn.init.normal_(module.weight, mean=0.0, std=getattr(module, 'std', 0.02))
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
@@ -84,6 +84,7 @@ class Attention(nn.Module):
         self.v = nn.Linear(config.embed_size, self.num_kv_heads * self.head_dim, bias=config.use_bias)
         self.out = nn.Linear(config.embed_size, config.embed_size, bias=config.use_bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.out.std = 0.02 / math.sqrt(2 * config.num_layers)
 
     def forward(self, x, past, past_len, freqs_cis=None):
         B, T, C = x.shape
@@ -116,6 +117,7 @@ class FeedForward(nn.Module):
         self.up = nn.Linear(config.embed_size, int(config.embed_size * config.expansion_ratio), bias=config.use_bias)
         self.down = nn.Linear(int(config.embed_size * config.expansion_ratio), config.embed_size, bias=config.use_bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.down.std = 0.02 / math.sqrt(2 * config.num_layers)
 
     def forward(self, x):
         if self.gate is None:
@@ -156,11 +158,7 @@ class GPT(nn.Module):
         self.out = nn.Linear(config.embed_size, config.vocab_size, bias=False)
         if config.tie_weights:
             self.embed_tokens.weight = self.out.weight
-
         self.apply(init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith('down.weight'):
-                nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.num_layers))
 
     def forward(self, x, past=None, past_len=0):
         assert past is None or past_len < past.shape[4]
@@ -179,7 +177,7 @@ class GPT(nn.Module):
         x = self.out(self.ln(x))
         return x
 
-    @torch.no_grad()
+    @torch.no_grad
     def generate(self, context, num_tokens=1, temperature=1.0, top_k=-1):
         num_kv_heads = self.config.num_kv_heads or self.config.num_heads
         past = torch.zeros(len(context), self.config.num_layers, num_kv_heads, 2, self.config.context_size, self.config.embed_size // self.config.num_heads, device=context.device)
