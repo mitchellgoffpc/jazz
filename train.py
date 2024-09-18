@@ -31,8 +31,8 @@ DTYPES = {'f32': torch.float32, 'bf16': torch.bfloat16}
 class Config:
     num_steps: int = 10000
     num_val_steps: int = 10
-    batch_size: int = 64
-    grad_accum_steps: int = 8
+    batch_size: int = 512
+    micro_batch_size: int = 8
     learning_rate: float = 6e-4
     learning_rate_decay: bool = True
     weight_decay: float = 0.1
@@ -82,8 +82,8 @@ def train(rank, world_size, config, result_path):
         {'params': [p for p in model.parameters() if p.dim() < 2], 'weight_decay': 0.0}]
     optimizer = torch.optim.AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=True)
 
-    assert config.batch_size % config.grad_accum_steps == 0, "batch_size must be a multiple of grad_accum_steps"
-    B = config.batch_size // config.grad_accum_steps
+    assert config.batch_size % (config.micro_batch_size * world_size) == 0, "batch_size must be a multiple of micro_batch_size * world_size"
+    grad_accum_steps = config.batch_size // (config.micro_batch_size * world_size)
     dtype = DTYPES[config.dtype]
     use_amp = dtype is not torch.float32
     if rank == 0:
@@ -113,8 +113,8 @@ def train(rank, world_size, config, result_path):
 
     def get_lr(step):  # credit to karpathy's build-nanogpt
         max_lr, min_lr = config.learning_rate, config.learning_rate * 0.1
-        warmup_steps = 375*1000*1000 // (world_size * config.batch_size * config.model.context_size)  # 375M tokens
-        decay_steps = config.num_steps  # 10*1000*1000*1000 // (world_size * config.batch_size * config.model.context_size)  # 10B tokens
+        warmup_steps = 375*1000*1000 // (config.batch_size * config.model.context_size)  # 375M tokens
+        decay_steps = config.num_steps  # 10*1000*1000*1000 // (config.batch_size * config.model.context_size)  # 10B tokens
         if not config.learning_rate_decay:  # no decay
             return max_lr
         elif step < warmup_steps:  # warmup
@@ -131,12 +131,12 @@ def train(rank, world_size, config, result_path):
         model.train()
         optimizer.zero_grad()
         total_loss = 0.0
-        for i in range(config.grad_accum_steps):
-            batch_tokens = tokens[i*B : i*B+B]
-            model.require_backward_grad_sync = (i == config.grad_accum_steps - 1)
-            with torch.amp.autocast(enabled=use_amp, dtype=dtype, device_type=device.type):
+        for i in range(grad_accum_steps):
+            batch_tokens = tokens[i*config.micro_batch_size : (i+1)*config.micro_batch_size]
+            model.require_backward_grad_sync = (i == grad_accum_steps - 1)
+            with torch.autocast(enabled=use_amp, dtype=dtype, device_type=device.type):
                 outputs = model(batch_tokens[:, :-1])
-                loss = F.cross_entropy(outputs.flatten(end_dim=1), batch_tokens[:, 1:].flatten()) / config.grad_accum_steps
+                loss = F.cross_entropy(outputs.flatten(end_dim=1), batch_tokens[:, 1:].flatten()) / grad_accum_steps
             loss.backward()
             total_loss += loss.item()
 
@@ -154,11 +154,11 @@ def train(rank, world_size, config, result_path):
     def val_step(tokens):
         model.eval()
         total_loss = 0.0
-        for i in range(config.grad_accum_steps):
-            batch_tokens = tokens[i*B : i*B+B]
-            with torch.amp.autocast(enabled=use_amp, dtype=dtype, device_type=device.type):
+        for i in range(grad_accum_steps):
+            batch_tokens = tokens[i*config.micro_batch_size : (i+1)*config.micro_batch_size]
+            with torch.autocast(enabled=use_amp, dtype=dtype, device_type=device.type):
                 outputs = model(batch_tokens[:, :-1])
-                total_loss += F.cross_entropy(outputs.flatten(end_dim=1), batch_tokens[:, 1:].flatten()).item() / config.grad_accum_steps
+                total_loss += F.cross_entropy(outputs.flatten(end_dim=1), batch_tokens[:, 1:].flatten()).item() / grad_accum_steps
         return all_reduce(total_loss, device) / world_size
 
     @torch.no_grad
@@ -178,7 +178,7 @@ def train(rank, world_size, config, result_path):
         tokens = next(train_loader).to(device)
         loss, norm, lr = train_step(tokens, step=step)
         step_time = time.perf_counter() - start_time
-        tokens_per_sec = (world_size * config.batch_size * config.model.context_size) / step_time
+        tokens_per_sec = (config.batch_size * config.model.context_size) / step_time
 
         if rank == 0:
             print(f"step: {step:6d} | loss: {loss:.6f} | norm: {norm:.4f} | lr: {lr:.4e} | dt: {step_time*1000:.1f}ms | tok/s: {tokens_per_sec:.1f}")
@@ -191,8 +191,7 @@ def train(rank, world_size, config, result_path):
                 print('---\n... running evals ...', end='\r')
 
             start_time = time.perf_counter()
-            # val_loss = sum(val_step(tokens.to(device)) for tokens in itertools.islice(val_loader, config.num_val_steps)) / config.num_val_steps
-            val_loss = 0.0
+            val_loss = sum(val_step(tokens.to(device)) for tokens in itertools.islice(val_loader, config.num_val_steps)) / config.num_val_steps
             hellaswag_accuracy = eval_hellaswag()
             eval_time = time.perf_counter() - start_time
 
