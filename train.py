@@ -60,6 +60,8 @@ def all_reduce(data, device):
     return data.item()
 
 def train(rank, world_size, config, result_path):
+    device = torch.device(f'cuda:{rank}')
+    torch.cuda.set_device(device)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
     # Load the dataset
@@ -70,7 +72,6 @@ def train(rank, world_size, config, result_path):
 
     # Instantiate the model and optimizer
     torch.set_float32_matmul_precision('high')
-    device = torch.device(f'cuda:{rank}')
     raw_model = GPT(config.model).to(device)
     model = torch.compile(raw_model) if config.compile else raw_model
     model = DDP(model, device_ids=[rank])
